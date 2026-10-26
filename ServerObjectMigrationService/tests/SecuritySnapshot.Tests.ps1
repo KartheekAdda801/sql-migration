@@ -141,13 +141,11 @@ Describe 'Complete source security capture' {
             'COALESCE\(\s*c\.name\s+COLLATE\s+DATABASE_DEFAULT\s*,\s*k\.name\s+COLLATE\s+DATABASE_DEFAULT\s*\)'
         )
     }
-    It 'Reports protected built-in identities without recreating them' {
+    It 'Excludes built-in identities completely, including a renamed sa' {
         $P = New-TestPrincipal 'renamed-sa'; $P.PrincipalId = 1
         $script:Principals = @($P, (New-TestPrincipal 'NT SERVICE\SQLAgent' 'U'))
         $Blocks = @(Get-ServerObjectSecuritySnapshotBlocks 'SOURCE' | Where-Object Kind -eq 'ProtectedPrincipal')
-        $Blocks.Count | Should -Be 2
-        $Blocks.Sql -join '' | Should -Not -Match 'CREATE LOGIN|ALTER LOGIN'
-        $Blocks.Sql -join '' | Should -Match 'Protected source security entry'
+        $Blocks.Count | Should -Be 0
     }
     It 'Handles empty catalogs without null-shaped fake blocks' {
         $script:Principals = @(); $script:Users = @(); $script:PermissionRows = @(); $script:Databases = @()
@@ -233,16 +231,14 @@ Describe 'Complete source security capture' {
         })
         $Blocks = @(Get-ServerObjectSecuritySnapshotBlocks 'SOURCE')
         @($Blocks | Where-Object Kind -eq 'DatabaseRoleOwner').Count | Should -Be 0
-        ($Blocks | Where-Object Kind -eq 'DatabaseRole' | Select-Object -First 1).Sql |
-            Should -Not -Match 'CREATE ROLE'
+        @($Blocks | Where-Object Kind -eq 'DatabaseRole').Count | Should -Be 0
     }
-    It 'Reports immutable system schema ownership without attempting ALTER AUTHORIZATION' {
+    It 'Excludes immutable system schema ownership' {
         Mock Invoke-SqlcmdLogged { [pscustomobject]@{ Name = 'dbo'; OwnerName = 'dbo' } } -ParameterFilter {
             $Context -eq 'SecuritySnapshot.SchemaOwners'
         }
         $Blocks = @(Get-ServerObjectSecuritySnapshotBlocks 'SOURCE' | Where-Object Kind -eq 'SchemaOwner')
-        $Blocks.Sql -join '' | Should -Match 'Protected source security entry'
-        $Blocks.Sql -join '' | Should -Not -Match 'ALTER AUTHORIZATION'
+        $Blocks.Count | Should -Be 0
     }
     It 'Persists only JSON-compatible metadata and replays after round trip without source access' {
         $Blocks = @(Get-ServerObjectSecuritySnapshotBlocks 'SOURCE')
@@ -251,6 +247,83 @@ Describe 'Complete source security capture' {
         foreach ($Block in $RoundTrip) {
             ConvertTo-ServerObjectSecurityReplaySql $Block $Vm | Should -Be $Block.Sql
         }
+    }
+    It 'Filters SID-one, internal, service and key logins without discarding application-like names' {
+        $Renamed = New-TestPrincipal 'renamed-admin'; $Renamed.Sid = '0x01'
+        $script:Principals = @(
+            $Renamed, (New-TestPrincipal '##MS_PolicySigningCertificate##' 'C'),
+            (New-TestPrincipal 'BUILTIN\Administrators' 'G'), (New-TestPrincipal 'NT AUTHORITY\SYSTEM' 'U'),
+            (New-TestPrincipal 'custom-key-login' 'K'), (New-TestPrincipal 'application-system-admin-service'),
+            (New-TestPrincipal 'DOMAIN\service-admin' 'U'), (New-TestPrincipal 'DOMAIN\ApplicationGroup' 'G')
+        )
+        $script:Users = @(); $script:PermissionRows = @()
+        $Blocks = @(Get-ServerObjectSecuritySnapshotBlocks SOURCE)
+        @($Blocks | Where-Object Kind -eq Login).Name |
+            Should -Be @('application-system-admin-service', 'DOMAIN\service-admin', 'DOMAIN\ApplicationGroup')
+    }
+    It 'Keeps user assignments to fixed roles and custom roles but removes built-in dependency fanout' {
+        $Sa = New-TestPrincipal 'renamed-sa'; $Sa.Sid = '0x01'
+        $Fixed = New-TestPrincipal 'sysadmin' 'R'; $Fixed.IsFixedRole = $true
+        $Custom = New-TestPrincipal 'custom-role' 'R'; $Custom.OwnerName = 'renamed-sa'
+        $script:Principals = @($Sa, $Fixed, $Custom, (New-TestPrincipal 'app'))
+        Mock Invoke-SqlcmdLogged {
+            [pscustomobject]@{ RoleName = 'sysadmin'; MemberName = 'renamed-sa' }
+            [pscustomobject]@{ RoleName = 'sysadmin'; MemberName = 'app' }
+            [pscustomobject]@{ RoleName = 'custom-role'; MemberName = 'app' }
+        } -ParameterFilter { $Context -eq 'SecuritySnapshot.ServerMemberships' }
+        Mock Invoke-SqlcmdLogged {
+            [pscustomobject]@{ Class = 100; State = 'G'; PermissionName = 'CONNECT SQL'; GranteeName = 'sysadmin'; GrantorName = 'renamed-sa' }
+            [pscustomobject]@{ Class = 100; State = 'G'; PermissionName = 'CONNECT SQL'; GranteeName = 'app'; GrantorName = 'renamed-sa' }
+            [pscustomobject]@{ Class = 101; State = 'G'; PermissionName = 'IMPERSONATE'; GranteeName = 'app'; GrantorName = 'renamed-sa'; SecurableName = 'renamed-sa' }
+        } -ParameterFilter { $Context -eq 'SecuritySnapshot.ServerPermissions' }
+        $Blocks = @(Get-ServerObjectSecuritySnapshotBlocks SOURCE)
+        @($Blocks | Where-Object Kind -eq ServerMembership).Name | Should -Be @('sysadmin/app', 'custom-role/app')
+        @($Blocks | Where-Object Kind -eq ServerRole).Name | Should -Be @('custom-role')
+        @($Blocks | Where-Object Kind -eq ServerRoleOwner).Count | Should -Be 0
+        $Permission = @($Blocks | Where-Object Kind -eq ServerPermission)
+        $Permission.Count | Should -Be 1
+        $Permission[0].Sql | Should -Match 'GRANT CONNECT SQL TO \[app\];'
+        $Permission[0].Metadata.GrantorName | Should -Be 'renamed-sa'
+    }
+    It 'Filters database built-ins, login aliases, role permissions and owners while retaining custom roles' {
+        $Sa = New-TestPrincipal 'renamed-sa'; $Sa.Sid = '0x01'
+        $script:Principals += $Sa
+        $script:Users = @(
+            $script:Users[0],
+            [pscustomobject]@{ PrincipalId = 1; Name = 'dbo'; Type = 'S' },
+            [pscustomobject]@{ PrincipalId = 5; Name = 'db_datareader'; Type = 'R'; IsFixedRole = $true },
+            [pscustomobject]@{ PrincipalId = 20; Name = 'custom-role'; Type = 'R'; OwnerName = 'dbo' },
+            [pscustomobject]@{ PrincipalId = 21; Name = 'alias-to-sa'; Type = 'S'; LoginName = 'renamed-sa' }
+        )
+        $SystemPermission = New-TestPermission; $SystemPermission.GranteeName = 'db_datareader'
+        $script:PermissionRows += $SystemPermission
+        Mock Invoke-SqlcmdLogged {
+            [pscustomobject]@{ RoleName = 'db_datareader'; MemberName = 'appuser' }
+            [pscustomobject]@{ RoleName = 'db_datareader'; MemberName = 'dbo' }
+        } -ParameterFilter { $Context -eq 'SecuritySnapshot.DatabaseMemberships' }
+        $Blocks = @(Get-ServerObjectSecuritySnapshotBlocks SOURCE | Where-Object Database -eq UnselectedApp)
+        @($Blocks | Where-Object Kind -eq DatabaseUser).Name | Should -Be @('appuser')
+        @($Blocks | Where-Object Kind -eq DatabaseRole).Name | Should -Be @('custom-role')
+        @($Blocks | Where-Object Kind -eq DatabaseMembership).Name | Should -Be @('db_datareader/appuser')
+        @($Blocks | Where-Object Kind -eq DatabasePermission).Count | Should -Be 1
+        ($Blocks | Where-Object Kind -eq DatabasePermission).Sql | Should -Not -Match 'AS \[dbo\]'
+        @($Blocks | Where-Object Kind -eq DatabaseRoleOwner).Count | Should -Be 0
+    }
+    It 'Distinguishes non-fixed msdb product roles from same-named application roles' {
+        $Role = [pscustomobject]@{ PrincipalId = 25; Name = 'SQLAgentUserRole'; Type = 'R'; IsFixedRole = $false }
+        Test-SecuritySnapshotSystemPrincipal $Role -DatabaseScope -DatabaseName msdb | Should -BeTrue
+        Test-SecuritySnapshotSystemPrincipal $Role -DatabaseScope -DatabaseName AppDb | Should -BeFalse
+        $script:Users += $Role
+        $ProductPermission = New-TestPermission; $ProductPermission.GranteeName = $Role.Name
+        $script:PermissionRows = @($ProductPermission)
+        Mock Invoke-SqlcmdLogged {
+            [pscustomobject]@{ RoleName = 'SQLAgentUserRole'; MemberName = 'appuser' }
+        } -ParameterFilter { $Context -eq 'SecuritySnapshot.DatabaseMemberships' }
+        $Blocks = @(Get-ServerObjectSecuritySnapshotBlocks SOURCE)
+        @($Blocks | Where-Object { $_.Database -eq 'msdb' -and $_.Kind -eq 'DatabaseRole' }).Count | Should -Be 0
+        @($Blocks | Where-Object { $_.Database -eq 'msdb' -and $_.Kind -eq 'DatabasePermission' }).Count | Should -Be 0
+        @($Blocks | Where-Object { $_.Database -eq 'msdb' -and $_.Kind -eq 'DatabaseMembership' }).Count | Should -Be 1
+        @($Blocks | Where-Object { $_.Database -eq 'UnselectedApp' -and $_.Kind -eq 'DatabaseRole' }).Count | Should -Be 1
     }
 }
 

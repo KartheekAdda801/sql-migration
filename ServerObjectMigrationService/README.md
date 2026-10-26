@@ -12,20 +12,39 @@ The VM, MI, and login-provisioning worker scripts remain directly under
 Their separate operational configs have been removed; the consolidated entry point
 supplies worker configuration. Keep both folders when copying the tool.
 
-Generate captures all supported source objects, regardless of execution flags,
+Generate captures all supported user/application source objects, regardless of execution flags,
 database selection, job regex, or provisioning settings. It never connects to
 the target, resolves on-premises AD identities, or provisions configured logins.
+SQLMI Generate additionally performs a **read-only Entra resolution/report pass**
+after raw extraction; SQLVM Generate does not query Entra. This deliberately extends
+the earlier source-only/no-directory-lookup generation contract without changing
+source identity metadata or connecting to target SQL.
 Use an explicit `-Activity Generate` override when taking a snapshot: the
-operational configuration currently selects `GenerateAndExecute`.
+operational configuration currently selects `Generate`.
 
-| Item ID | Target | SQL endpoint | Derived Blob container |
-|---------|--------|--------------|-------------------|
-| `VM-Objects` | SQLVM `akpersonalsqlvm` | `akpersonalsqlvm.centralus.cloudapp.azure.com:1433` | `desktop-sga61qp-dmf-sqlobjects-sqlvm` |
-| `MI-Objects` | SQLMI `ak-personal-sqlmi` | `ak-personal-sqlmi.public.3c52841dc1d0.database.windows.net:3342` | `desktop-sga61qp-dmf-sqlobjects-sqlmi` |
+| Item ID      | Target                        | SQL endpoint                                                        | Derived Blob container    |
+|--------------|-------------------------------|---------------------------------------------------------------------|---------------------------|
+| `MI-Objects` | SQLMI `free-sql-mi-6265221`     | `free-sql-mi-6265221.9c5d642b3e14.database.windows.net:1433`            | `sqlservermigvm-sqlobjects` |
 
-Both extract from `DESKTOP-SGA61QP\DMF`; `MIGRDEMO` is the current execution
-database selection, not an extraction filter. Both containers use `akpersonalsa`
-in `rg-ak-personal`; private-container creation is enabled if they are missing.
+Only `MI-Objects` is enabled. It extracts from the default SQL instance on
+`sqlservermigvm`; `MIGRDEMO` is the current execution database selection,
+not an extraction filter. Snapshots use `sqlmimigrationbackup` in
+`SQL-Migration-Assistant`; private-container creation is enabled if missing.
+The Azure tenant is `396b3622-063d-4ef2-9c28-383d840705b4` and the subscription
+is `bdac0d16-ad4b-4953-83f3-91b12451a425`. The old `VM-Objects` item is retained
+but disabled; update its settings before enabling it.
+Database Mail is disabled, so SMTP settings are not needed. Additional login
+provisioning is enabled for `DBUsrLogin` with `db_datareader` on `MIGRDEMO`,
+using secret `sql-DBUsrLogin-pwd` in Key Vault `sqlmig-kv`. Existing passwords
+are not reset (`ForcePasswordReset: false`). The Entra user `DBAGroup`
+(`01fe121e-dcad-4dc4-8223-678a9b61bd61`) is also configured with
+`db_datareader` and `db_datawriter` on `MIGRDEMO`; no Key Vault secret is
+required for this external login. The default `Generate` activity
+does not provision logins; use `ProvisionLogins` explicitly or provision during
+`Execute`/`GenerateAndExecute`. Existing source login migration remains enabled
+for replay.
+The MI endpoint uses port 1433, so the migration host needs network access to
+the MI virtual network through a connected VNet, peering, or VPN.
 The tool does not create storage accounts or change their network/RBAC settings.
 
 Containers normally have no platform suffix, for example
@@ -201,7 +220,8 @@ direct `ProvisionLogins`. `_All` is executable after database restoration.
 | `SQLLoginsMigrationFlag`, `SQLLoginsMigrationScope` | Security scripting and scope |
 | `SQLOperatorsMigrationFlag`, `SQLAlertsMigrationFlag` | Agent operators and alerts |
 | `SQLAgentJobsMigrationFlag`, `SQLAgentJobsMigrationScope`, `SQLAgentJobFilterCriteria` | Execute-only job enable, independent Server/All scope and name regex |
-| `JobOwnerUpnSuffix` | Optional MI Windows job-owner mapping suffix |
+| `JobOwnerUpnSuffix` | Explicit MI domain-user UPN suffix, shared by security and job-owner resolution; no default is invented |
+| `EntraIdentityMappings` | Optional object keyed by exact source Windows identity; values are reviewed Entra user UPNs or exact group display names |
 | `SQLDBMailMigrationFlag`, `SmtpServer`, `SmtpPort` | Optional mail scripting and relay |
 | `StorageAccountName`, `StorageResourceGroup` | Account/resource group; source-derived container |
 | `CreateContainerIfMissing` | Allow creation of a private container, never an account |
@@ -214,11 +234,85 @@ direct `ProvisionLogins`. `_All` is executable after database restoration.
 `SourceDomainSuffix` is appended only to a short source hostname before an
 instance suffix; FQDNs are not extended again. It is a SQL connection suffix,
 not an AD domain or an identity-mapping prefix. `DomainPrefix` is not a supported
-configuration property. MI replay resolves captured Windows identities through
-Entra using an existing UPN or `JobOwnerUpnSuffix`, failing on missing or ambiguous
-matches. Local Windows accounts are not automatically Entra users. New source
+configuration property. SQLVM retains domain users/groups and Windows authentication
+as-is on the domain-joined target; no Entra translation applies. SQLMI resolves
+captured Windows identities through Entra using a reviewed `EntraIdentityMappings`
+entry, an existing UPN, or an explicitly supplied `JobOwnerUpnSuffix` for domain users.
+Groups require a unique exact full source-name match unless explicitly mapped;
+the Windows domain is never stripped to guess a group. Local Windows identities
+require an explicit mapping, even when a suffix is configured. For example,
+`"EntraIdentityMappings": { "SOURCE\\localuser": "reviewed@contoso.com",
+"CONTOSO\\AppGroup": "Application Readers" }` documents reviewed mappings; it
+does not create those identities. Every mapping is verified in the configured
+tenant/subscription context. New source
 logins default to `master` for safe pre-restore connectivity; original defaults
 are retained in snapshot metadata for review rather than applied automatically.
+
+### System-object filtering and regeneration
+
+The shared source-capture helpers apply the same filtering before writing either
+Server or All snapshots, including GenerateAndExecute:
+
+* Exclude `sa` by SID `0x01` or principal ID (including renamed `sa`), reserved
+  `##` internal/policy identities, `NT SERVICE`, `NT AUTHORITY`, `BUILTIN`, and
+  certificate/asymmetric-key principals.
+* Keep application SQL logins, domain users/groups, supported external principals,
+  and custom roles. Words such as `admin`, `service`, or `system` in an application
+  name do not cause exclusion.
+* Exclude built-in database users, aliases mapped to excluded logins, fixed/public
+  role definitions and permissions, and dependent ownership/securable references.
+  Known non-fixed product roles are recognized only in `msdb` (Agent, Mail,
+  SSIS/DTS, data collector, policy, registered-server and target-server roles).
+  Same-named custom roles outside `msdb` remain eligible.
+* Retain user/custom-role membership in system roles. Keep user grants issued by
+  built-ins but emit them under the executing sysadmin instead of referencing a
+  source-only grantor; the original grantor remains in metadata. Custom-role
+  ownership by built-ins is not replayed; normal target creation ownership applies.
+* Exclude jobs marked `IsSystemObject` by SMO and the exact reserved product jobs
+  `syspolicy_purge_history` and `SSIS Server Maintenance Job`. Ownership by `sa`,
+  disabled state, category, or a generic name substring is not a system-job test.
+  Unknown/custom platform jobs remain eligible rather than risking user-job loss;
+  review them explicitly. Disabled user jobs remain in generated output, while
+  existing execution filters and disabled-on-target replay safeguards still apply.
+
+Generation never edits existing local output, archives, or stored snapshots in
+place. Rerun Generate into a new run directory to publish newly filtered snapshots;
+previous Blob snapshots remain unchanged until regeneration. Older snapshots retain
+their original contents and must be regenerated to receive these filtering rules
+and authoritative job-owner user/group and local-account metadata.
+
+### Missing Entra identity reports
+
+SQLMI writes `<run>/<item>/MissingEntraIdentities.csv` beside `SourceObjects`
+after generating all seven raw SQL files, irrespective of execution flags.
+Generate publishes those raw captures even if mappings are unresolved, but marks
+the identity-report component and item FAILED so the issue cannot be mistaken for
+successful migration. No identities are provisioned by this pass.
+
+Before replay, eligible security/job dependencies are resolved again against the
+current directory, writing `MissingEntraIdentities.Replay.csv` in the same item
+directory. GenerateAndExecute keeps both reports. Missing dependencies fail the
+affected component before its target validation/writes; independent components
+continue. Existing object-level SQL failures still produce FAILED results.
+WhatIf/preview validates in memory without writing CSVs.
+
+Each UTF-8 CSV has these columns, with one row per unresolved source identity/type:
+`SourceIdentity`, `PrincipalType` (`U` user, `G` group, or `UnknownWindows` for
+legacy job metadata), `Components`, `DependencyContexts`, `AttemptedMapping`,
+`FailureReason`, and `ErrorMessage`. Repeated database, permission and job
+references are deduplicated while retaining semicolon-separated dependency
+contexts. All missing identities are collected, not just the first failure.
+`NotFound`, `Ambiguous`, `DirectoryAccessError` (including authorization, context
+and network failures), `ExplicitMappingRequired`, and `InvalidDirectoryResponse`
+are distinct remediation categories. Directory outages are not reported as missing
+users. A successful pass produces a header-only CSV.
+
+Report paths appear in the identity component's `OutputFile`, the item's
+`IdentityReports`, and `migration.log`, including failures. Reports contain no
+passwords, hashes or tokens, but do contain identity names and dependency context;
+handle them as access-control information. They remain local and are not uploaded
+as managed Blob snapshot files. Give the infrastructure team the CSV, remediate
+directory access/identities or explicit mappings, and rerun Generate/replay.
 
 The old `ManagedIdentityName`, `ManagedIdentityRoles`, and
 `ManagedIdentityPermissions` properties and their generated SQL component have
@@ -271,27 +365,23 @@ migration connection.
 
 ### Configure administrative SQL login authentication
 
-The operational config selects SQL login authentication for both targets:
+The enabled MI item selects SQL login authentication for replay:
 
 ```json
 {
   "TargetSqlAuthType": "SqlLogin",
   "SqlCredentialMode": "Configured",
-  "credential": "sql_vm_admin"
+  "credential": "sql_target"
 }
 ```
 
-The MI item references `sql_mi_admin` instead. Create `password.local.json`
-beside your selected config with the same format as DMS:
+Before replay, create `password.local.json` beside your selected config
+with the same format as DMS:
 
 ```json
 {
   "credentials": {
-    "sql_vm_admin": {
-      "username": "<VM administrative SQL login>",
-      "password": "<VM SQL password>"
-    },
-    "sql_mi_admin": {
+    "sql_target": {
       "username": "<MI administrative SQL login>",
       "password": "<MI SQL password>"
     }
@@ -376,16 +466,16 @@ From the repository root:
 $Script = '.\ServerObjectMigrationService\scripts\Invoke-MigrateServerObjects-OnPrem-AzSQL.ps1'
 $Config = '.\ServerObjectMigrationService\config\Invoke-MigrateServerObjects-ProvisionLogin-AzSql.config.json'
 
-# Read-only checks for both configured targets; no local output or new containers.
+# Read-only checks for enabled targets; no local output or new containers.
 & $Script -ConfigPath $Config -WhatIf
 
-# Generate and upload source SQL. With ProvisionLogins=false, no target SQL writes.
+# Generate and upload source SQL without target SQL writes, even with provisioning enabled.
 $Run = & $Script -ConfigPath $Config -Activity Generate
 $Run | Format-List ProcessId, Status, RunDirectory, ResultsPath
 & $Script -Activity Monitor -RunDirectory $Run.RunDirectory
 
 # Select one target instead.
-& $Script -ConfigPath $Config -ItemId 'VM-Objects' -Activity Generate
+& $Script -ConfigPath $Config -ItemId 'MI-Objects' -Activity Generate
 ```
 
 Illustrative preview output:
@@ -393,7 +483,6 @@ Illustrative preview output:
 ```text
 ItemId     Activity Status          RunId
 ------     -------- ------          -----
-VM-Objects Generate PreflightPassed
 MI-Objects Generate PreflightPassed
 ```
 
@@ -649,6 +738,8 @@ before executing it; provisioning is not a substitute for arbitrary source permi
 Each item validates shared prerequisites before generation or replay. Local run
 tracking is created first so failures are recorded. Generate checks source SQL
 and storage without connecting to target SQL, even with provisioning enabled.
+SQLMI generation also performs the read-only Entra report pass described above;
+its directory failures are recorded separately from raw extraction/storage failures.
 Execute verifies the complete stored snapshot before target writes. Configured
 login provisioning validates target access, directory identities, secrets, and
 per-login permissions independently from source-object replay. Replay validates

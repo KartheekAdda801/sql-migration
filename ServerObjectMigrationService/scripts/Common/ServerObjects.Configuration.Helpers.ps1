@@ -36,7 +36,7 @@ function Get-ServerObjectDefaults {
         TargetSqlAuthType = 'Auto'; credential = ''; SqlCredentialMode = 'Interactive'
         SqlCredentialPath = ''; SqlUserName = ''; SqlPasswordEnvironmentVariable = ''
         TargetName = ''; TargetType = ''; TargetSqlHost = ''; TargetSqlPort = 0
-        TenantId = ''; SubscriptionId = ''; JobOwnerUpnSuffix = ''
+        TenantId = ''; SubscriptionId = ''; JobOwnerUpnSuffix = ''; EntraIdentityMappings = @{}
         SQLAgentJobFilterCriteria = '.*'; SQLAgentJobsMigrationFlag = 'Yes'; SQLAgentJobsMigrationScope = 'All'
         SQLLoginsMigrationFlag = 'Yes'; SQLLoginsMigrationScope = 'All'
         SQLOperatorsMigrationFlag = 'Yes'; SQLAlertsMigrationFlag = 'Yes'
@@ -150,6 +150,16 @@ function Read-ServerObjectItems {
             }
         }
         $Values.Id = $Item.Id
+        if ($Values.EntraIdentityMappings -isnot [Collections.IDictionary]) {
+            throw "EntraIdentityMappings must be an object keyed by exact source identity on '$($Item.Id)'."
+        }
+        foreach ($Key in $Values.EntraIdentityMappings.Keys) {
+            if ([string]::IsNullOrWhiteSpace($Key) -or
+                $Values.EntraIdentityMappings[$Key] -isnot [string] -or
+                [string]::IsNullOrWhiteSpace($Values.EntraIdentityMappings[$Key])) {
+                throw "EntraIdentityMappings requires nonempty source names and target UPN/display-name strings on '$($Item.Id)'."
+            }
+        }
         $Platforms = @($Configuration.Items | ForEach-Object {
             $Candidate = @{}
             foreach ($Name in @('SourceServerName', 'StorageAccountName', 'TargetType')) {

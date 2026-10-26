@@ -50,7 +50,16 @@ function Get-ServerObjectJobSnapshotBlocks {
     $Options.ScriptDrops = $false
     # Replay owns existence checks; an outer SMO guard would skip in-place updates.
     $Options.IncludeIfNotExists = $false
+    $Owners = @(Invoke-SqlcmdLogged -ServerInstance $Server -Database master -Context 'JobSnapshot.Owners' -Query @'
+SELECT name AS Name,type AS Type,CONVERT(bit,CASE WHEN type IN ('U','G') AND
+ LEFT(name,CHARINDEX('\',name))=CONVERT(nvarchar(128),SERVERPROPERTY('MachineName'))+'\' THEN 1 ELSE 0 END) AS IsLocalWindowsPrincipal
+FROM sys.server_principals;
+'@)
     foreach ($Job in $Source.JobServer.Jobs) {
+        # SMO exposes IsSystemObject on supported versions. Reserved product jobs are
+        # an exact-name fallback; owner/category/disabled state never prove system origin.
+        if ($Job.IsSystemObject -or $Job.Name -in @('syspolicy_purge_history', 'SSIS Server Maintenance Job')) { continue }
+        $OwnerPrincipal = @($Owners | Where-Object Name -eq $Job.OwnerLoginName)
         $Databases = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         $Warnings = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         $Operators = @(
@@ -128,6 +137,8 @@ function Get-ServerObjectJobSnapshotBlocks {
             SourceEnabled = [bool]$Job.IsEnabled; Sql = $Sql
             Metadata = [pscustomobject]@{
                 Owner = [string]$Job.OwnerLoginName; Category = [string]$Job.Category
+                OwnerType = if ($OwnerPrincipal.Count -eq 1) { [string]$OwnerPrincipal[0].Type } else { '' }
+                OwnerIsLocal = ($OwnerPrincipal.Count -eq 1 -and [bool]$OwnerPrincipal[0].IsLocalWindowsPrincipal)
                 Subsystems = [string[]]@($Steps.Subsystem | Sort-Object -Unique)
                 DependencyWarnings = [string[]]@($Warnings | Sort-Object); Steps = $Steps
                 NotificationOperators = [string[]]$Operators
@@ -144,14 +155,11 @@ function ConvertTo-ServerObjectJobReplaySql {
     try {
         $Owner = [string]$Block.Metadata.Owner
         $MappedOwner = $Owner
-        if ($Item.TargetType -eq 'SQLMI' -and $Owner -match '\\') {
-            $Suffix = [string]$Item.JobOwnerUpnSuffix
-            if ([string]::IsNullOrWhiteSpace($Suffix) -or $Suffix.Trim().TrimStart('@') -notmatch '^[^@\s\\]+$') {
-                throw "JobOwnerUpnSuffix is required and must be a valid domain to map Windows owner '$Owner'."
+        if ($Item.TargetType -eq 'SQLMI' -and ($Block.Metadata.OwnerType -in @('U', 'G') -or $Owner -match '\\')) {
+            if ($Block.Metadata.OwnerType -notin @('U', 'G')) {
+                throw "Windows job owner '$Owner' lacks captured user/group type; regenerate the source snapshot before Entra resolution."
             }
-            $Sam = ($Owner -split '\\')[-1]
-            if ([string]::IsNullOrWhiteSpace($Sam)) { throw "Cannot resolve Windows owner '$Owner'." }
-            $MappedOwner = $Sam + '@' + $Suffix.Trim().TrimStart('@')
+            $MappedOwner = Resolve-SecuritySnapshotEntraPrincipal $Owner $Block.Metadata.OwnerType $Item -IsLocal:([bool]$Block.Metadata.OwnerIsLocal)
         }
         if ($Item.TargetType -eq 'SQLMI') {
             foreach ($Subsystem in $Block.Metadata.Subsystems) {

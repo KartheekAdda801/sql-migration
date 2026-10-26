@@ -5,6 +5,7 @@
 BeforeAll {
     Import-Module SqlServer -ErrorAction Stop
     . (Join-Path $PSScriptRoot '..\scripts\Common\ServerObjects.Helpers.ps1')
+    . (Join-Path $PSScriptRoot '..\scripts\Common\ServerObjects.SecuritySnapshot.Helpers.ps1')
     . (Join-Path $PSScriptRoot '..\scripts\Common\ServerObjects.JobSnapshot.Helpers.ps1')
     function New-TestStep {
         param($Command = 'SELECT 1;', $Database = 'master', $Subsystem = 'TransactSql', $Proxy = '')
@@ -28,7 +29,7 @@ BeforeAll {
         param($Owner = 'sa')
         [pscustomobject]@{
             Name = "job's name"; SourceEnabled = $true
-            Metadata = [pscustomobject]@{ Owner = $Owner; Subsystems = @('TransactSql'); Steps = @() }
+            Metadata = [pscustomobject]@{ Owner = $Owner; OwnerType = $(if ($Owner -match '\\') { 'U' } else { 'S' }); Subsystems = @('TransactSql'); Steps = @() }
             Sql = @"
 DECLARE @jobId uniqueidentifier;
 EXEC msdb.dbo.sp_add_job @job_name=N'job''s name', @enabled=1, @owner_login_name=N'$Owner', @job_id=@jobId OUTPUT;
@@ -47,6 +48,7 @@ Describe 'Source-only SQL Agent snapshot' -Tag Unit {
     BeforeEach {
         $script:Jobs = @()
         Mock Connect-SmoTrusted { [pscustomobject]@{ JobServer = [pscustomobject]@{ Jobs = $script:Jobs } } }
+        Mock Invoke-SqlcmdLogged { @() }
     }
     It 'Captures enabled and disabled jobs without name/database filtering or source mutation' {
         $script:Jobs = @(
@@ -73,6 +75,27 @@ Describe 'Source-only SQL Agent snapshot' -Tag Unit {
     }
     It 'Returns no blocks for an empty source' {
         @(Get-ServerObjectJobSnapshotBlocks -Server source).Count | Should -Be 0
+    }
+    It 'Excludes system metadata and exact platform jobs but retains user jobs owned by sa' {
+        $System = New-TestJob -Name 'metadata-system'
+        $System | Add-Member NoteProperty IsSystemObject $true
+        $script:Jobs = @($System, (New-TestJob -Name 'syspolicy_purge_history'),
+            (New-TestJob -Name 'SSIS Server Maintenance Job'),
+            (New-TestJob -Name 'user-system-service-admin' -Owner sa -Enabled $false))
+        $Blocks = @(Get-ServerObjectJobSnapshotBlocks source)
+        $Blocks.Name | Should -Be @('user-system-service-admin')
+        $Blocks[0].SourceEnabled | Should -BeFalse
+        $Blocks[0].Metadata.Owner | Should -Be sa
+    }
+    It 'Captures group and local owner metadata without translating the raw job script' {
+        $script:Jobs = @((New-TestJob -Owner 'SOURCE\group'))
+        Mock Invoke-SqlcmdLogged {
+            [pscustomobject]@{ Name = 'SOURCE\group'; Type = 'G'; IsLocalWindowsPrincipal = $true }
+        } -ParameterFilter { $Context -eq 'JobSnapshot.Owners' }
+        $Block = Get-ServerObjectJobSnapshotBlocks source
+        $Block.Metadata.OwnerType | Should -Be G
+        $Block.Metadata.OwnerIsLocal | Should -BeTrue
+        $Block.Sql | Should -Match 'SOURCE\\group'
     }
     It 'Does not claim empty jobs or notification dependencies are self-contained' {
         $Job = New-TestJob -Steps @()
@@ -166,6 +189,21 @@ Describe 'Offline SQL Agent replay' -Tag Unit {
         $null = ConvertTo-ServerObjectJobReplaySql -Block (New-TestReplayBlock) -Item $script:VmItem
         Should -Invoke ConvertTo-ServerObjectJobUpsertSql -Times 1 -Exactly
     }
+    It 'Preserves domain job owners on SQLVM without Entra lookup' {
+        Mock Resolve-SecuritySnapshotEntraPrincipal { throw 'VM must not resolve Entra identities' }
+        $Block = New-TestReplayBlock -Owner 'DOMAIN\owner'
+        $Sql = ConvertTo-ServerObjectJobReplaySql $Block $script:VmItem
+        $Sql | Should -Match "@owner_login_name = N'DOMAIN\\owner'"
+        Should -Invoke Resolve-SecuritySnapshotEntraPrincipal -Times 0
+    }
+    It 'Resolves job-owner groups as groups rather than manufacturing a user UPN' {
+        Mock Resolve-SecuritySnapshotEntraPrincipal { 'Reviewed Group' }
+        $Block = New-TestReplayBlock -Owner 'DOMAIN\group'
+        $Block.Metadata.OwnerType = 'G'
+        $Sql = ConvertTo-ServerObjectJobReplaySql $Block ([pscustomobject]@{ TargetType = 'SQLMI' })
+        $Sql | Should -Match "@owner_login_name = N'Reviewed Group'"
+        Should -Invoke Resolve-SecuritySnapshotEntraPrincipal -Times 1 -Exactly -ParameterFilter { $Type -eq 'G' }
+    }
     It 'Inserts disabled state when add/update statements omit enabled' {
         $Block = New-TestReplayBlock
         $Block.Sql = "EXEC msdb.dbo.sp_add_job @job_name=N'j'; EXEC msdb.dbo.sp_update_job @job_name=N'j';"
@@ -175,12 +213,14 @@ Describe 'Offline SQL Agent replay' -Tag Unit {
     }
     It 'Requires an explicit suffix for Windows owners with job/owner context' {
         $Item = [pscustomobject]@{ TargetType = 'SQLMI'; JobOwnerUpnSuffix = '' }
+        Mock Resolve-SecuritySnapshotEntraPrincipal { throw "Cannot map Windows user 'DOMAIN\owner': supply a valid JobOwnerUpnSuffix." }
         { ConvertTo-ServerObjectJobReplaySql -Block (New-TestReplayBlock -Owner 'DOMAIN\owner') -Item $Item } |
-            Should -Throw "*job's name*JobOwnerUpnSuffix*DOMAIN\owner*"
+            Should -Throw "*job's name*DOMAIN\owner*JobOwnerUpnSuffix*"
         Should -Invoke Connect-SmoTrusted -Times 0
     }
-    It 'Maps Windows owners only at replay and fails explicitly in SQL if target login is unresolved' {
+    It 'Uses the verified Entra resolver for Windows owners and retains the target login guard' {
         $Item = [pscustomobject]@{ TargetType = 'SQLMI'; JobOwnerUpnSuffix = '@example.com' }
+        Mock Resolve-SecuritySnapshotEntraPrincipal { 'owner@example.com' }
         $Block = New-TestReplayBlock -Owner 'DOMAIN\owner'
         $Sql = ConvertTo-ServerObjectJobReplaySql -Block $Block -Item $Item
         $Sql | Should -Match "SUSER_ID\(N'owner@example.com'\) IS NULL THROW"
@@ -190,6 +230,9 @@ Describe 'Offline SQL Agent replay' -Tag Unit {
         $Block.Sql | Should -Match 'DOMAIN\\owner'
         { Get-ServerObjectJobSqlTree -Sql $Sql } | Should -Not -Throw
         Should -Invoke Connect-SmoTrusted -Times 0
+        Should -Invoke Resolve-SecuritySnapshotEntraPrincipal -Times 1 -Exactly -ParameterFilter {
+            $Name -eq 'DOMAIN\owner' -and $Type -eq 'U'
+        }
     }
     It 'Rejects MI unsupported subsystems and proxies rather than removing them' {
         $Item = [pscustomobject]@{ TargetType = 'SQLMI'; JobOwnerUpnSuffix = '' }

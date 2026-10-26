@@ -391,7 +391,10 @@ Describe 'Source container naming' -Tag 'Unit' {
             $Item.TargetSqlAuthType = 'SqlLogin'
             $Credential = [pscredential]::new('offline-admin', (ConvertTo-SecureString 'offline-test-password' -AsPlainText -Force))
             $Results = @(Invoke-ServerObjectSnapshotReplay -Item $Item -Root $Root -SqlCredential $Credential)
-            $Results.Status | Should -Be @('SUCCESS', 'SUCCESS', 'SUCCESS', 'SUCCESS', 'SUCCESS')
+            @($Results | Where-Object Component -ne 'EntraIdentityMapping').Status |
+                Should -Be @('SUCCESS', 'SUCCESS', 'SUCCESS', 'SUCCESS', 'SUCCESS')
+            @($Results | Where-Object Component -eq 'EntraIdentityMapping').Count |
+                Should -Be $(if ($TargetType -eq 'SQLMI') { 1 } else { 0 })
             Should -Invoke Assert-ServerObjectSqlAccess -Times 5 -Exactly -ParameterFilter {
                 $SqlCredential.UserName -eq 'offline-admin' -and -not $TenantId
             }

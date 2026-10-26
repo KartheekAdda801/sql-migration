@@ -99,7 +99,7 @@ function New-ServerObjectItemResult {
         ItemId = $Item.Id; SourceServer = $Item.SourceServerName; TargetServer = $Item.TargetName
         Component = 'Server objects'; Mode = $Item.Activity; Status = $Status
         RunId = $RunId; OutputFile = (Join-Path $RunRoot $Item.Id); ProvisionLogins = $Item.ProvisionLogins
-        BlobManifest = ''; ErrorMessage = $ErrorMessage; Components = @()
+        BlobManifest = ''; ErrorMessage = $ErrorMessage; Components = @(); IdentityReports = @()
     }
 }
 
@@ -196,6 +196,12 @@ function Invoke-ServerObjectItem {
                 [datetime]::UtcNow, $Item.Id, $Item.Activity, $Item.SourceServerName, $Item.TargetSqlHost, $Item.TargetSqlPort, $_.Exception.Message)
         }
     }
+    $Result.IdentityReports = @(
+        foreach ($Name in @('MissingEntraIdentities.csv', 'MissingEntraIdentities.Replay.csv')) {
+            $Path = Join-Path $Result.OutputFile $Name
+            if (Test-Path -LiteralPath $Path) { $Path }
+        }
+    )
     $Failures = @($Result.Components | Where-Object Status -eq 'FAILED')
     if ($Failures.Count) {
         $Result.Status = 'FAILED'

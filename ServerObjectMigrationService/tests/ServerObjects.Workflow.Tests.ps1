@@ -31,6 +31,24 @@ Describe 'Server-object script layout' -Tag 'Unit' {
     }
 }
 
+Describe 'Reviewed Entra identity mapping configuration' -Tag 'Unit' {
+    It 'Preserves exact reviewed source-to-target mappings without modifying provisioning definitions' {
+        $Path = New-TestConfiguration {
+            param($Json)
+            $Json.Items[0].EntraIdentityMappings = @{ 'SOURCE\local' = 'reviewed@cloud.example'; 'DOMAIN\Team' = 'Reviewed Team' }
+        }
+        $Items = @(Read-ServerObjectItems -Path $Path)
+        $Items[0].EntraIdentityMappings['SOURCE\local'] | Should -Be 'reviewed@cloud.example'
+        $Items[0].EntraIdentityMappings['DOMAIN\Team'] | Should -Be 'Reviewed Team'
+    }
+    It 'Rejects invalid mapping shape <Value>' -ForEach @(
+        @{ Value = @('not-an-object') }, @{ Value = @{ 'SOURCE\local' = 42 } }, @{ Value = @{ 'SOURCE\local' = '' } }
+    ) {
+        $Path = New-TestConfiguration { param($Json) $Json.Items[0].EntraIdentityMappings = $Value }
+        { Read-ServerObjectItems -Path $Path } | Should -Throw '*EntraIdentityMappings*'
+    }
+}
+
 Describe 'WhatIf item selection and preflight diagnostics' -Tag 'Unit' {
     BeforeAll {
         $PreviewConfiguration = Join-Path $TestDrive 'preview.config.json'

@@ -23,6 +23,32 @@ resolved identity. Unmatched Windows groups require an exact, unique Entra displ
 database-only Windows users additionally require the resolved target login to be provisioned.
 #>
 
+function Test-SecuritySnapshotSystemPrincipal {
+    <#
+    .SYNOPSIS
+        Classifies reserved principals using catalog metadata, not application-name heuristics.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param($Principal, [switch]$DatabaseScope, [string]$DatabaseName = '')
+    if ($Principal.Type -in @('C', 'K')) { return $true }
+    if ($Principal.Type -eq 'R') {
+        if ([bool]$Principal.IsFixedRole -or $Principal.Name -eq 'public') { return $true }
+        # These product roles are not marked is_fixed_role. Scope the exact names
+        # to msdb so a legitimate same-named application role is not discarded.
+        return ($DatabaseName -eq 'msdb' -and $Principal.Name -in @(
+            'SQLAgentUserRole', 'SQLAgentReaderRole', 'SQLAgentOperatorRole', 'DatabaseMailUserRole',
+            'db_ssisadmin', 'db_ssisltduser', 'db_ssisoperator', 'db_dtsadmin', 'db_dtsltduser', 'db_dtsoperator',
+            'dc_admin', 'dc_operator', 'dc_proxy', 'PolicyAdministratorRole',
+            'ServerGroupAdministratorRole', 'ServerGroupReaderRole', 'TargetServersRole'
+        ))
+    }
+    if ($DatabaseName -eq 'msdb' -and $Principal.Name -eq 'MS_DataCollectorInternalUser') { return $true }
+    if ($Principal.Name -match '^(##|NT SERVICE\\|NT AUTHORITY\\|BUILTIN\\)') { return $true }
+    if ($DatabaseScope) { return ([int]$Principal.PrincipalId -le 4) }
+    ([int]$Principal.PrincipalId -eq 1 -or [string]$Principal.Sid -eq '0x01')
+}
+
 function ConvertTo-SecuritySnapshotHex {
     param($Value, [string]$Description)
     if ($Value -is [byte[]]) { return '0x' + [BitConverter]::ToString($Value).Replace('-', '') }
@@ -177,7 +203,9 @@ SELECT p.principal_id AS PrincipalId, p.name AS Name, p.type AS Type,
  s.is_expiration_checked AS ExpirationChecked,
  CONVERT(varchar(max),s.password_hash,1) AS PasswordHash,
  CONVERT(int,LOGINPROPERTY(p.name,'IsMustChange')) AS MustChange,
- owner.name AS OwnerName, c.name AS CredentialName
+ owner.name AS OwnerName, c.name AS CredentialName,
+ CONVERT(bit,CASE WHEN p.type IN ('U','G') AND
+ LEFT(p.name,CHARINDEX('\',p.name))=CONVERT(nvarchar(128),SERVERPROPERTY('MachineName'))+'\' THEN 1 ELSE 0 END) AS IsLocalWindowsPrincipal
 FROM sys.server_principals p
 LEFT JOIN sys.sql_logins s ON p.principal_id=s.principal_id
 LEFT JOIN sys.server_principals owner ON owner.principal_id=p.owning_principal_id
@@ -185,9 +213,15 @@ LEFT JOIN sys.credentials c ON c.credential_id=p.credential_id
 ORDER BY CASE WHEN p.type='R' THEN 1 ELSE 0 END,p.name;
 '@ 'ServerPrincipals')
     $Protected = @{}
+    $FixedRoles = @{}
     $ServerTypes = @{}
     foreach ($P in $Principals) { $ServerTypes[[string]$P.Name] = [string]$P.Type }
     foreach ($P in $Principals) {
+        if (Test-SecuritySnapshotSystemPrincipal $P) {
+            $Protected[[string]$P.Name] = $true
+            if ($P.Type -eq 'R') { $FixedRoles[[string]$P.Name] = $true }
+            continue
+        }
         $M = @{
             Name = [string]$P.Name; Type = [string]$P.Type; Sid = [string]$P.Sid
             DefaultDatabase = [string]$P.DefaultDatabase; DefaultLanguage = [string]$P.DefaultLanguage
@@ -195,12 +229,7 @@ ORDER BY CASE WHEN p.type='R' THEN 1 ELSE 0 END,p.name;
             ExpirationChecked = [bool]$P.ExpirationChecked; PasswordHash = [string]$P.PasswordHash
             OwnerName = [string]$P.OwnerName; IsFixedRole = ([bool]$P.IsFixedRole -or $P.Name -eq 'public')
             PrincipalId = [int]$P.PrincipalId
-        }
-        if ([int]$P.PrincipalId -eq 1 -or $P.Name -match '^(##|NT SERVICE\\|NT AUTHORITY\\|BUILTIN\\)') {
-            $M.Reason = 'Internal or machine-bound principal: captured for review, never recreated or modified.'
-            $Protected[[string]$P.Name] = $true
-            $Blocks.Add((New-SecuritySnapshotBlock $P.Name 'ProtectedPrincipal' '' $M))
-            continue
+            IsLocalWindowsPrincipal = [bool]$P.IsLocalWindowsPrincipal
         }
         if ($P.Type -notin @('S', 'U', 'G', 'E', 'X', 'R')) { throw "Unsupported server principal '$($P.Name)' type '$($P.Type)' (certificate/asymmetric logins require separately reviewed key material)." }
         if ($P.CredentialName) { throw "Login '$($P.Name)' uses credential '$($P.CredentialName)'; credential secret extraction is unsupported." }
@@ -214,6 +243,7 @@ ORDER BY CASE WHEN p.type='R' THEN 1 ELSE 0 END,p.name;
         $Blocks.Add((New-SecuritySnapshotBlock $P.Name $Kind '' $M))
     }
     foreach ($P in $Principals | Where-Object { $_.Type -eq 'R' -and -not $_.IsFixedRole -and $_.Name -ne 'public' -and $_.OwnerName }) {
+        if ($Protected.ContainsKey([string]$P.Name) -or $Protected.ContainsKey([string]$P.OwnerName)) { continue }
         $Blocks.Add((New-SecuritySnapshotBlock $P.Name 'ServerRoleOwner' '' @{
             Name = [string]$P.Name; OwnerName = [string]$P.OwnerName
             OwnerType = [string]$ServerTypes[[string]$P.OwnerName]
@@ -225,6 +255,8 @@ JOIN sys.server_principals r ON r.principal_id=rm.role_principal_id
 JOIN sys.server_principals m ON m.principal_id=rm.member_principal_id ORDER BY r.name,m.name;
 '@ 'ServerMemberships')
     foreach ($R in $Memberships) {
+        if ($Protected.ContainsKey([string]$R.MemberName) -or
+            ($Protected.ContainsKey([string]$R.RoleName) -and -not $FixedRoles.ContainsKey([string]$R.RoleName))) { continue }
         $Blocks.Add((New-SecuritySnapshotBlock "$($R.RoleName)/$($R.MemberName)" 'ServerMembership' '' @{
             RoleName = [string]$R.RoleName; MemberName = [string]$R.MemberName
             MemberType = [string]$ServerTypes[[string]$R.MemberName]
@@ -244,6 +276,10 @@ LEFT JOIN sys.server_principals s ON p.class=101 AND s.principal_id=p.major_id
 LEFT JOIN sys.endpoints e ON p.class=105 AND e.endpoint_id=p.major_id
 ORDER BY g.name,p.class,p.major_id,p.permission_name,a.name;
 '@ 'ServerPermissions')
+    $Permissions = @($Permissions | Where-Object {
+        -not $Protected.ContainsKey([string]$_.GranteeName) -and
+        -not ([int]$_.Class -eq 101 -and $Protected.ContainsKey([string]$_.SecurableName))
+    })
     foreach ($R in @(Get-OrderedSecuritySnapshotPermissions -Rows $Permissions)) {
         $Target = Get-SecuritySnapshotPermissionTarget $R -ServerScope
         if ([int]$R.Class -ne 100 -and -not $R.SecurableName) { throw "Unresolved server permission for '$($R.GranteeName)'." }
@@ -254,6 +290,7 @@ ORDER BY g.name,p.class,p.major_id,p.permission_name,a.name;
             SecurableType = [string]$R.SecurableType
             GranteeType = [string]$ServerTypes[[string]$R.GranteeName]
             GrantorType = [string]$ServerTypes[[string]$R.GrantorName]
+            UseExecutionGrantor = $Protected.ContainsKey([string]$R.GrantorName)
             SecurablePrincipalType = [string]$ServerTypes[[string]$R.SecurableName]
             Protected = [bool]$Protected.ContainsKey([string]$R.GranteeName)
         }))
@@ -268,7 +305,7 @@ WHERE d.state=0 ORDER BY d.database_id;
         $Db = [string]$D.Name
         if ([int]$D.HasAccess -ne 1) { throw "Online database '$Db' is inaccessible; security snapshot aborted." }
         if ($D.OwnerSid -and -not $D.OwnerName) { throw "Database '$Db' has an unresolved owner SID '$($D.OwnerSid)'; resolve ownership before capture." }
-        if ($D.OwnerName) {
+        if ($D.OwnerName -and $Db -notin @('master', 'msdb', 'model', 'tempdb') -and -not $Protected.ContainsKey([string]$D.OwnerName)) {
             $Blocks.Add((New-SecuritySnapshotBlock $Db 'DatabaseOwner' $Db @{
                 Name = $Db; OwnerName = [string]$D.OwnerName; OwnerSid = [string]$D.OwnerSid
                 OwnerType = [string]$ServerTypes[[string]$D.OwnerName]
@@ -280,6 +317,8 @@ SELECT p.principal_id AS PrincipalId,p.name AS Name,p.type AS Type,
  p.authentication_type_desc AS AuthenticationType,p.is_fixed_role AS IsFixedRole,
  CONVERT(varchar(max),p.sid,1) AS Sid,p.default_schema_name AS DefaultSchema,
  l.name AS LoginName,l.type AS LoginType,o.name AS OwnerName,
+ CONVERT(bit,CASE WHEN p.type IN ('U','G') AND
+ LEFT(p.name,CHARINDEX('\',p.name))=CONVERT(nvarchar(128),SERVERPROPERTY('MachineName'))+'\' THEN 1 ELSE 0 END) AS IsLocalWindowsPrincipal,
  COALESCE(c.name COLLATE DATABASE_DEFAULT,k.name COLLATE DATABASE_DEFAULT) AS KeyName
 FROM sys.database_principals p
 LEFT JOIN sys.server_principals l ON l.sid=p.sid AND p.type<>'R'
@@ -288,20 +327,26 @@ LEFT JOIN sys.certificates c ON p.type='C' AND c.sid=p.sid
 LEFT JOIN sys.asymmetric_keys k ON p.type='K' AND k.sid=p.sid
 ORDER BY CASE WHEN p.type='R' THEN 1 ELSE 0 END,p.name;
 '@ 'DatabasePrincipals')
+        $DatabaseProtected = @{}
+        $DatabaseFixedRoles = @{}
         foreach ($P in $Users) {
+            if ((Test-SecuritySnapshotSystemPrincipal $P -DatabaseScope -DatabaseName $Db) -or
+                ($P.LoginName -and $Protected.ContainsKey([string]$P.LoginName))) {
+                $DatabaseProtected[[string]$P.Name] = $true
+                if ($P.Type -eq 'R') { $DatabaseFixedRoles[[string]$P.Name] = $true }
+            }
+        }
+        foreach ($P in $Users) {
+            if ($DatabaseProtected.ContainsKey([string]$P.Name)) { continue }
             $M = @{
                 Name = [string]$P.Name; Type = [string]$P.Type; Sid = [string]$P.Sid
                 AuthenticationType = [string]$P.AuthenticationType; IsFixedRole = ([bool]$P.IsFixedRole -or $P.Name -eq 'public')
                 DefaultSchema = [string]$P.DefaultSchema; LoginName = [string]$P.LoginName
                 LoginType = [string]$P.LoginType; OwnerName = [string]$P.OwnerName; KeyName = [string]$P.KeyName
+                IsLocalWindowsPrincipal = [bool]$P.IsLocalWindowsPrincipal
             }
             if ($P.Type -in @('E', 'X')) { $M.EntraObjectId = ConvertFrom-SecuritySnapshotExternalSid $P.Sid }
             if ($P.Type -eq 'S' -and $P.AuthenticationType -eq 'NONE') { $M.RequiresRestoredDatabase = $true }
-            if ($P.Name -match '^(##|NT SERVICE\\|NT AUTHORITY\\)' -or ([int]$P.PrincipalId -le 4 -and $P.Type -ne 'R')) {
-                $M.Reason = 'Built-in database identity: creation is protected; explicit permissions are captured separately.'
-                $Blocks.Add((New-SecuritySnapshotBlock $P.Name 'ProtectedPrincipal' $Db $M))
-                continue
-            }
             if ($P.Type -notin @('S', 'U', 'G', 'E', 'X', 'R', 'C', 'K')) { throw "Unsupported database principal '$Db/$($P.Name)' type '$($P.Type)'." }
             if ($P.Type -eq 'S' -and $P.AuthenticationType -eq 'DATABASE') { throw "Contained SQL user '$Db/$($P.Name)' password hash is not exposed by supported catalogs; extraction aborted." }
             if ($P.Type -eq 'S' -and $P.AuthenticationType -ne 'NONE' -and -not $P.LoginName) {
@@ -312,6 +357,7 @@ ORDER BY CASE WHEN p.type='R' THEN 1 ELSE 0 END,p.name;
             $Blocks.Add((New-SecuritySnapshotBlock $P.Name $Kind $Db $M))
         }
         foreach ($P in $Users | Where-Object { $_.Type -eq 'R' -and -not $_.IsFixedRole -and $_.Name -ne 'public' -and $_.OwnerName }) {
+            if ($DatabaseProtected.ContainsKey([string]$P.Name) -or $DatabaseProtected.ContainsKey([string]$P.OwnerName) -or $P.OwnerName -eq 'dbo') { continue }
             $Blocks.Add((New-SecuritySnapshotBlock $P.Name 'DatabaseRoleOwner' $Db @{ Name = [string]$P.Name; OwnerName = [string]$P.OwnerName }))
         }
         $Schemas = @(& $Read $Db @'
@@ -320,6 +366,7 @@ JOIN sys.database_principals p ON p.principal_id=s.principal_id
 ORDER BY s.name;
 '@ 'SchemaOwners')
         foreach ($S in $Schemas) {
+            if ($S.Name -in @('dbo', 'guest', 'sys', 'INFORMATION_SCHEMA') -or $DatabaseProtected.ContainsKey([string]$S.OwnerName)) { continue }
             $Blocks.Add((New-SecuritySnapshotBlock $S.Name 'SchemaOwner' $Db @{
                 Name = [string]$S.Name; OwnerName = [string]$S.OwnerName
                 Protected = ($S.Name -in @('dbo', 'guest', 'sys', 'INFORMATION_SCHEMA'))
@@ -332,6 +379,7 @@ JOIN sys.database_principals p ON p.principal_id=o.principal_id
 WHERE o.is_ms_shipped=0 ORDER BY s.name,o.name;
 '@ 'ObjectOwners')
         foreach ($O in $Objects) {
+            if ($DatabaseProtected.ContainsKey([string]$O.OwnerName)) { continue }
             $Blocks.Add((New-SecuritySnapshotBlock "$($O.SchemaName).$($O.Name)" 'ObjectOwner' $Db @{
                 Name = [string]$O.Name; SchemaName = [string]$O.SchemaName; OwnerName = [string]$O.OwnerName
             }))
@@ -342,6 +390,8 @@ JOIN sys.database_principals r ON r.principal_id=rm.role_principal_id
 JOIN sys.database_principals m ON m.principal_id=rm.member_principal_id ORDER BY r.name,m.name;
 '@ 'DatabaseMemberships')
         foreach ($R in $Members) {
+            if ($DatabaseProtected.ContainsKey([string]$R.MemberName) -or
+                ($DatabaseProtected.ContainsKey([string]$R.RoleName) -and -not $DatabaseFixedRoles.ContainsKey([string]$R.RoleName))) { continue }
             $Blocks.Add((New-SecuritySnapshotBlock "$($R.RoleName)/$($R.MemberName)" 'DatabaseMembership' $Db @{
                 RoleName = [string]$R.RoleName; MemberName = [string]$R.MemberName
                 Protected = ($R.MemberName -match '^(##|NT SERVICE\\|NT AUTHORITY\\)')
@@ -389,6 +439,10 @@ LEFT JOIN sys.registered_search_property_lists sl ON p.class=31 AND sl.property_
 LEFT JOIN sys.database_scoped_credentials cr ON p.class=32 AND cr.credential_id=p.major_id
 ORDER BY g.name,p.class,p.major_id,p.minor_id,p.permission_name,a.name;
 '@ 'DatabasePermissions')
+        $Permissions = @($Permissions | Where-Object {
+            -not $DatabaseProtected.ContainsKey([string]$_.GranteeName) -and
+            -not ([int]$_.Class -eq 4 -and $DatabaseProtected.ContainsKey([string]$_.SecurableName))
+        })
         foreach ($R in @(Get-OrderedSecuritySnapshotPermissions -Rows $Permissions)) {
             $Target = Get-SecuritySnapshotPermissionTarget $R
             $Blocks.Add((New-SecuritySnapshotBlock "$($R.GranteeName)/$($R.PermissionName)/$Target" 'DatabasePermission' $Db @{
@@ -396,6 +450,7 @@ ORDER BY g.name,p.class,p.major_id,p.minor_id,p.permission_name,a.name;
                 PermissionName = [string]$R.PermissionName; State = [string]$R.State
                 Class = [int]$R.Class; MinorId = [int]$R.MinorId; Target = $Target
                 SecurableName = [string]$R.SecurableName; SecurableType = [string]$R.SecurableType
+                UseExecutionGrantor = $DatabaseProtected.ContainsKey([string]$R.GrantorName)
                 Protected = ($R.GranteeName -match '^(##|NT SERVICE\\|NT AUTHORITY\\)')
             }))
         }
@@ -404,49 +459,188 @@ ORDER BY g.name,p.class,p.major_id,p.minor_id,p.permission_name,a.name;
 }
 
 function Resolve-SecuritySnapshotEntraPrincipal {
-    param([string]$Name, [string]$Type, $Item, [switch]$PassThru)
+    <#
+    .SYNOPSIS
+        Verifies an exact Windows-to-Entra mapping using read-only directory queries.
+    .DESCRIPTION
+        Does not change Azure context, consult AD, or invent a tenant suffix.
+        Failure metadata distinguishes identity remediation from directory access errors.
+    #>
+    [CmdletBinding()]
+    [OutputType([string], [pscustomobject])]
+    param([string]$Name, [string]$Type, $Item, [switch]$PassThru, [switch]$IsLocal)
     if ($Type -notin @('U', 'G')) { return $Name }
-    $Context = Get-AzContext -ErrorAction Stop
-    if (-not $Item.TenantId -or -not $Item.SubscriptionId -or
-        [string]$Context.Tenant.Id -ne [string]$Item.TenantId -or
-        [string]$Context.Subscription.Id -ne [string]$Item.SubscriptionId) {
-        throw "Windows principal '$Name' requires an authenticated Azure context matching configured TenantId and SubscriptionId; no context is changed automatically."
+    $Key = "$Type|$Name"
+    if ($Item.EntraResolutionCache -and $Item.EntraResolutionCache.ContainsKey($Key)) {
+        $Entry = $Item.EntraResolutionCache[$Key]
+        if ($Entry.Failure) { throw $Entry.Failure }
+        if ($PassThru) { return $Entry.Resolved }
+        return $Entry.Resolved.Name
     }
-    if ($Name -match '^(NT SERVICE|NT AUTHORITY|BUILTIN)\\') { throw "Machine-bound principal '$Name' cannot be mapped to Entra." }
-    if ($Type -eq 'U') {
-        $Upn = $Name
-        if ($Name -notmatch '^[^\\@\s]+@[^\\@\s]+\.[^\\@\s]+$') {
-            $Suffix = [string]$Item.JobOwnerUpnSuffix
-            $Suffix = $Suffix.TrimStart('@')
-            if ($Suffix -notmatch '^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$' -or
-                $Name -notmatch '^[^\\]+\\([^\\@\s]+)$') {
-                throw "Cannot map Windows user '$Name': supply a valid JobOwnerUpnSuffix or capture a valid UPN; AD/source lookup is forbidden."
+    $Attempt = $Name
+    $Reason = 'DirectoryAccessError'
+    try {
+        $Context = Get-AzContext -ErrorAction Stop
+        if (-not $Item.TenantId -or -not $Item.SubscriptionId -or
+            [string]$Context.Tenant.Id -ne [string]$Item.TenantId -or
+            [string]$Context.Subscription.Id -ne [string]$Item.SubscriptionId) {
+            throw "Windows principal '$Name' requires an authenticated Azure context matching configured TenantId and SubscriptionId; no context is changed automatically."
+        }
+        if ($Name -match '^(NT SERVICE|NT AUTHORITY|BUILTIN)\\') { throw "Machine-bound principal '$Name' cannot be mapped to Entra." }
+        $Reason = 'ExplicitMappingRequired'
+        $Explicit = if ($Item.EntraIdentityMappings -and $Item.EntraIdentityMappings.Contains($Name)) {
+            [string]$Item.EntraIdentityMappings[$Name]
+        } else { '' }
+        if ($IsLocal -and -not $Explicit) { throw "Local Windows identity '$Name' requires an explicit EntraIdentityMappings entry; a suffix is not evidence of directory identity." }
+        if ($Type -eq 'U') {
+            $Upn = if ($Explicit) { $Explicit } else { $Name }
+            if ($Upn -notmatch '^[^\\@\s]+@[^\\@\s]+\.[^\\@\s]+$') {
+                if ($Explicit) { throw "Explicit mapping for Windows user '$Name' must be a valid Entra UPN." }
+                $Suffix = ([string]$Item.JobOwnerUpnSuffix).TrimStart('@')
+                if ($Suffix -notmatch '^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$' -or
+                    $Name -notmatch '^[^\\]+\\([^\\@\s]+)$') {
+                    throw "Cannot map Windows user '$Name': supply a valid JobOwnerUpnSuffix or capture a valid UPN; AD/source lookup is forbidden."
+                }
+                $Account = ($Name -split '\\', 2)[1]
+                $Upn = "$Account@$Suffix"
             }
-            $Account = ($Name -split '\\', 2)[1]
-            $Upn = "$Account@$Suffix"
+            $Attempt = $Upn
+            $Reason = 'DirectoryAccessError'
+            $Candidates = @(Get-AzADUser -UserPrincipalName $Upn -ErrorAction Stop | Where-Object { $_.UserPrincipalName -eq $Upn })
+            $Reason = if ($Candidates.Count -eq 0) { 'NotFound' } else { 'Ambiguous' }
+            if ($Candidates.Count -ne 1) { throw "Entra UPN '$Upn' for '$Name' resolved to $($Candidates.Count) users; provide a unique valid UPN/suffix." }
+            $ResolvedName = [string]$Candidates[0].UserPrincipalName
+            $ResolvedId = [string]$Candidates[0].Id
         }
-        $Candidates = @(Get-AzADUser -UserPrincipalName $Upn -ErrorAction Stop | Where-Object { $_.UserPrincipalName -eq $Upn })
-        if ($Candidates.Count -ne 1) { throw "Entra UPN '$Upn' for '$Name' resolved to $($Candidates.Count) users; provide a unique valid UPN/suffix." }
-        $ResolvedName = [string]$Candidates[0].UserPrincipalName
-        $ResolvedId = [string]$Candidates[0].Id
-    }
-    else {
-        # Use the full captured name: dropping the Windows domain would guess an identity.
-        $Candidates = @(Get-AzADGroup -DisplayName $Name -ErrorAction Stop | Where-Object { $_.DisplayName -eq $Name })
-        if ($Candidates.Count -ne 1) {
-            throw "Windows group '$Name' has no unique exact Entra display-name match. Provision/rename an unambiguous Entra group before replay; domain stripping and AD lookup are forbidden."
+        else {
+            # Use the full captured name: dropping the Windows domain would guess an identity.
+            $Attempt = if ($Explicit) { $Explicit } else { $Name }
+            $Reason = 'DirectoryAccessError'
+            $Candidates = @(Get-AzADGroup -DisplayName $Attempt -ErrorAction Stop | Where-Object { $_.DisplayName -eq $Attempt })
+            $Reason = if ($Candidates.Count -eq 0) { 'NotFound' } else { 'Ambiguous' }
+            if ($Candidates.Count -ne 1) {
+                throw "Windows group '$Name' has no unique exact Entra display-name match. Provision/rename an unambiguous Entra group before replay; domain stripping and AD lookup are forbidden."
+            }
+            $ResolvedName = [string]$Candidates[0].DisplayName
+            $ResolvedId = [string]$Candidates[0].Id
         }
-        $ResolvedName = [string]$Candidates[0].DisplayName
-        $ResolvedId = [string]$Candidates[0].Id
-    }
-    if ($PassThru) {
+        $Reason = 'InvalidDirectoryResponse'
         $ObjectId = [guid]::Empty
         if (-not [guid]::TryParse($ResolvedId, [ref]$ObjectId) -or $ObjectId -eq [guid]::Empty) {
             throw "Entra lookup for '$Name' did not return a valid object ID; replay aborted."
         }
-        return [pscustomobject]@{ Name = $ResolvedName; ObjectId = $ObjectId.ToString() }
+        if ($PassThru) { return [pscustomobject]@{ Name = $ResolvedName; ObjectId = $ObjectId.ToString() } }
+        $ResolvedName
     }
-    $ResolvedName
+    catch {
+        if ($Reason -eq 'DirectoryAccessError' -and
+            ($_.Exception.StatusCode -eq 404 -or $_.Exception.Response.StatusCode -eq 404 -or
+             $_.FullyQualifiedErrorId -match 'Request_ResourceNotFound|ResourceNotFound')) {
+            $Reason = 'NotFound'
+        }
+        $_.Exception.Data['IdentityFailureReason'] = $Reason
+        $_.Exception.Data['AttemptedMapping'] = $Attempt
+        throw
+    }
+}
+
+function Get-ServerObjectEntraIdentityReference {
+    <#
+    .SYNOPSIS
+        Enumerates Windows login dependencies without changing captured identities.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([Parameter(Mandatory)]$Block)
+    $M = $Block.Metadata
+    if (-not $M -or $M.Protected -or $Block.Kind -eq 'ProtectedPrincipal') { return }
+    $References = @(switch ($Block.Kind) {
+        Login { ,@($M.Name, $M.Type, [bool]$M.IsLocalWindowsPrincipal) }
+        DatabaseUser {
+            if ($M.LoginName) { ,@($M.LoginName, $M.LoginType, [bool]$M.IsLocalWindowsPrincipal) }
+            elseif ($M.WindowsWithoutLogin) { ,@($M.Name, $M.Type, [bool]$M.IsLocalWindowsPrincipal) }
+        }
+        { $_ -in @('ServerRoleOwner', 'DatabaseOwner') } { ,@($M.OwnerName, $M.OwnerType, $false) }
+        ServerMembership { ,@($M.MemberName, $M.MemberType, $false) }
+        ServerPermission {
+            ,@($M.GranteeName, $M.GranteeType, $false)
+            if (-not $M.UseExecutionGrantor) { ,@($M.GrantorName, $M.GrantorType, $false) }
+            if ([int]$M.Class -eq 101) { ,@($M.SecurableName, $M.SecurablePrincipalType, $false) }
+        }
+        Job {
+            $Type = [string]$M.OwnerType
+            if (-not $Type -and $M.Owner -match '\\') { $Type = 'UnknownWindows' }
+            ,@($M.Owner, $Type, [bool]$M.OwnerIsLocal)
+        }
+    })
+    foreach ($Reference in $References) {
+        if ($Reference[1] -in @('U', 'G', 'UnknownWindows')) {
+            [pscustomobject]@{ Name = [string]$Reference[0]; Type = [string]$Reference[1]; IsLocal = [bool]$Reference[2]
+                Component = $Block.Component
+                Context = "$($Block.Component)/$($Block.Database)/$($Block.Kind)/$($Block.Name)" }
+        }
+    }
+}
+
+function Export-ServerObjectMissingEntraIdentities {
+    <#
+    .SYNOPSIS
+        Resolves every distinct Windows dependency and reports all failures alongside run output.
+    .DESCRIPTION
+        SQLMI only. Uses read-only directory queries, never SQL target access or Azure writes.
+        The per-pass cache pins successful IDs and makes failed dependencies fail replay.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([Parameter(Mandatory)]$Item, [AllowEmptyCollection()][object[]]$Blocks,
+        [Parameter(Mandatory)][string]$Root, [switch]$Replay, [switch]$Preview)
+    if ($Item.TargetType -ne 'SQLMI') { return }
+    $Cache = @{}
+    $Item | Add-Member -NotePropertyName EntraResolutionCache -NotePropertyValue $Cache -Force
+    $References = @($Blocks | ForEach-Object { Get-ServerObjectEntraIdentityReference -Block $_ })
+    $Rows = [Collections.Generic.List[object]]::new()
+    foreach ($Group in @($References | Group-Object { "$($_.Type)|$($_.Name)" })) {
+        $Reference = $Group.Group[0]
+        $Key = "$($Reference.Type)|$($Reference.Name)"
+        try {
+            if ($Reference.Type -eq 'UnknownWindows') {
+                $Exception = [InvalidOperationException]::new('Windows job owner lacks captured user/group type; regenerate the source snapshot.')
+                $Exception.Data['IdentityFailureReason'] = 'ExplicitMappingRequired'
+                $Exception.Data['AttemptedMapping'] = $Reference.Name
+                throw $Exception
+            }
+            $IsLocal = @($Group.Group | Where-Object IsLocal).Count -gt 0
+            $SourceHost = (([string]$Item.SourceServerName -split '\\', 2)[0] -split '\.', 2)[0]
+            if ($SourceHost -and $Reference.Name.StartsWith("$SourceHost\", [StringComparison]::OrdinalIgnoreCase)) { $IsLocal = $true }
+            $Resolved = Resolve-SecuritySnapshotEntraPrincipal $Reference.Name $Reference.Type $Item -PassThru -IsLocal:$IsLocal
+            $Cache[$Key] = @{ Resolved = $Resolved }
+        }
+        catch {
+            $Cache[$Key] = @{ Failure = $_.Exception }
+            $Rows.Add([pscustomobject][ordered]@{
+                SourceIdentity = $Reference.Name
+                PrincipalType = $Reference.Type
+                Components = (@($Group.Group.Component | Sort-Object -Unique) -join '; ')
+                DependencyContexts = (@($Group.Group.Context | Sort-Object -Unique) -join '; ')
+                AttemptedMapping = [string]$_.Exception.Data['AttemptedMapping']
+                FailureReason = [string]$_.Exception.Data['IdentityFailureReason']
+                ErrorMessage = $_.Exception.Message
+            })
+        }
+    }
+    $FileName = if ($Replay) { 'MissingEntraIdentities.Replay.csv' } else { 'MissingEntraIdentities.csv' }
+    $Path = Join-Path (Split-Path -Parent $Root) $FileName
+    if (-not $Preview) {
+        $null = [IO.Directory]::CreateDirectory((Split-Path -Parent $Path))
+        if ($Rows.Count) { $Rows.ToArray() | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding utf8 }
+        else { Set-Content -LiteralPath $Path -Encoding utf8 -Value '"SourceIdentity","PrincipalType","Components","DependencyContexts","AttemptedMapping","FailureReason","ErrorMessage"' }
+    }
+    $Affected = @($Rows | ForEach-Object { $_.Components -split '; ' } | Sort-Object -Unique)
+    Write-Log "SQLMI identity report: '$Path'; $($Rows.Count) unresolved identities. No target connections or identity provisioning performed." INFO
+    [pscustomobject]@{ Component = 'EntraIdentityMapping'; Mode = $Item.Activity; Phase = 'IdentityResolution'
+        Status = $(if ($Rows.Count) { 'FAILED' } else { 'SUCCESS' }); OutputFile = $Path
+        ItemCount = $Rows.Count; AffectedComponents = $Affected
+        ErrorMessage = $(if ($Rows.Count) { "$($Rows.Count) unresolved Entra identities; see '$Path'." } else { '' }) }
 }
 
 function ConvertTo-ServerObjectSecurityReplaySql {
@@ -474,7 +668,7 @@ function ConvertTo-ServerObjectSecurityReplaySql {
         Login {
             $Type = [string]$M.Type
             if ($IsMi -and $Type -in @('U', 'G')) {
-                $Resolved = Resolve-SecuritySnapshotEntraPrincipal $Name $Type $Item -PassThru
+                $Resolved = Resolve-SecuritySnapshotEntraPrincipal $Name $Type $Item -PassThru -IsLocal:([bool]$M.IsLocalWindowsPrincipal)
                 $Name = $Resolved.Name
                 $N = & $Q $Name; $NL = & $L $Name
                 $Create = "CREATE LOGIN $N FROM EXTERNAL PROVIDER WITH OBJECT_ID = '$($Resolved.ObjectId)';"
@@ -546,7 +740,7 @@ ALTER ${Scope}ROLE $(& $Q $M.RoleName) ADD MEMBER $(& $Q $Member);
             if ($M.LoginName -or ($IsMi -and $M.WindowsWithoutLogin)) {
                 $Login = if ($M.LoginName) { [string]$M.LoginName } else { $Name }
                 $LoginType = if ($M.LoginName) { [string]$M.LoginType } else { [string]$M.Type }
-                if ($IsMi -and $LoginType -in @('U', 'G')) { $Login = Resolve-SecuritySnapshotEntraPrincipal $Login $LoginType $Item }
+                if ($IsMi -and $LoginType -in @('U', 'G')) { $Login = Resolve-SecuritySnapshotEntraPrincipal $Login $LoginType $Item -IsLocal:([bool]$M.IsLocalWindowsPrincipal) }
                 $LoginL = & $L $Login; $LoginQ = & $Q $Login
                 $Remap = if ($IsMi -and $LoginType -in @('U', 'G')) { "ALTER USER $N WITH LOGIN = $LoginQ;" } else { '' }
                 $SidGuard = if (-not $Remap) { "IF SUSER_SID($LoginL) <> $Sid THROW 51000, N'Target login SID differs from captured source; existing login was not overwritten. Reconcile explicitly before database replay.', 1;" } else { '' }
@@ -594,7 +788,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name=$NL) $Create
             $GrantorName = [string]$M.GrantorName
             if ($IsMi -and $Block.Kind -eq 'ServerPermission') {
                 $GranteeName = Resolve-SecuritySnapshotEntraPrincipal $GranteeName $M.GranteeType $Item
-                $GrantorName = Resolve-SecuritySnapshotEntraPrincipal $GrantorName $M.GrantorType $Item
+                if (-not $M.UseExecutionGrantor) { $GrantorName = Resolve-SecuritySnapshotEntraPrincipal $GrantorName $M.GrantorType $Item }
                 if ([int]$M.Class -eq 101 -and $M.SecurablePrincipalType -in @('U', 'G')) {
                     $Principal = Resolve-SecuritySnapshotEntraPrincipal $M.SecurableName $M.SecurablePrincipalType $Item
                     $Target = "LOGIN::$(& $Q $Principal)"
@@ -602,7 +796,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name=$NL) $Create
             }
             $On = if ($Target) { " ON $Target" } else { '' }
             $Grantee = & $Q $GranteeName
-            $Grantor = if ($GrantorName) { " AS $(& $Q $GrantorName)" } else { '' }
+            $Grantor = if ($GrantorName -and -not $M.UseExecutionGrantor) { " AS $(& $Q $GrantorName)" } else { '' }
             switch ([string]$M.State) {
                 G { $Statement = "GRANT $($M.PermissionName)$On TO $Grantee$Grantor;" }
                 W { $Statement = "GRANT $($M.PermissionName)$On TO $Grantee WITH GRANT OPTION$Grantor;" }

@@ -147,6 +147,9 @@ function New-ServerObjectSourceSnapshot {
         Write-ServerObjectSnapshotSql -Path (Join-Path $Root ($Relative.Replace('/', '\'))) -Blocks $Selected
         [pscustomobject]@{ Component = $Component; Mode = 'Generate'; Status = 'SUCCESS'; OutputFile = $Relative; ItemCount = $Selected.Count }
     }
+    # Raw snapshots are already written. This target-specific, read-only report is
+    # deliberately separate from immutable source metadata and Blob SQL files.
+    Export-ServerObjectMissingEntraIdentities -Item $Item -Blocks $Blocks.ToArray() -Root $Root
 }
 
 function ConvertTo-ServerObjectMailReplaySql {
@@ -276,6 +279,12 @@ function Invoke-ServerObjectSnapshotReplay {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Item, [Parameter(Mandatory)][string]$Root,
         [switch]$Preview, [object]$Snapshot, [pscredential]$SqlCredential)
+    $IdentityReport = $null
+    if ($Item.TargetType -eq 'SQLMI') {
+        $SelectedBlocks = @(Get-ServerObjectReplayBlocks -Item $Item -Root $Root -Snapshot $Snapshot)
+        $IdentityReport = Export-ServerObjectMissingEntraIdentities -Item $Item -Blocks $SelectedBlocks -Root $Root -Replay -Preview:$Preview
+        $IdentityReport
+    }
     $Auth = Get-ServerObjectTargetAuth -Item $Item -TargetSqlAuthType $Item.TargetSqlAuthType `
         -TrustServerCertificate $Item.TargetTrustServerCertificate -SqlCredential $SqlCredential
     if ($Item.TargetTrustServerCertificate) {
@@ -290,6 +299,9 @@ function Invoke-ServerObjectSnapshotReplay {
             continue
         }
         try {
+            if ($IdentityReport -and $Component -in $IdentityReport.AffectedComponents) {
+                throw "Component '$Component' has unresolved Entra dependencies. $($IdentityReport.ErrorMessage)"
+            }
             Write-Log "Validating item '$($Item.Id)', component '$Component', file '$Path', target '$($Item.TargetSqlHost),$($Item.TargetSqlPort)'." INFO
             Assert-ServerObjectReplayTarget -Item $Item -Root $Root -Snapshot $Snapshot -Component $Component -SqlCredential $SqlCredential
             $Blocks = @(Get-ServerObjectReplayBlocks -Item $Item -Root $Root -Snapshot $Snapshot -Components $Component)
