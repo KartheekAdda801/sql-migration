@@ -3,6 +3,10 @@
 /Agentic-SQL-Migration-Assistant/
 /azcopy/
 
+# Local implementation tracking and generated test results.
+/.copilot-tracking/
+/testResults.xml
+
 # Local SQL passwords must never be staged or published.
 password.local.json
 
