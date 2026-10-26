@@ -1,0 +1,15 @@
+# Local reference projects and downloaded tools.
+/Archive/
+/Agentic-SQL-Migration-Assistant/
+/azcopy/
+
+# Local SQL passwords must never be staged or published.
+password.local.json
+
+# Generated service output can contain login hashes and operational details.
+/DataMigrationService/logs/
+/DataMigrationService/reports/
+/DataMigrationService/output/
+/ServerObjectMigrationService/logs/
+/ServerObjectMigrationService/reports/
+/ServerObjectMigrationService/output/

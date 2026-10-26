@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 2,
+  "Common": {
+    "Enabled": true,
+    "Activity": "Execute",
+    "TenantId": "b7d7daca-8689-49f9-8a9b-d20adf81c78b",
+    "SubscriptionId": "cd7743ef-8ddc-4254-b715-2c79c8ab4126",
+    "SourceDomainSuffix": "",
+    "SQLDBMailMigrationFlag": "No",
+    "JobOwnerUpnSuffix": "",
+    "SmtpServer": "",
+    "SmtpPort": "",
+    "StorageAccountName": "akpersonalsa",
+    "StorageResourceGroup": "rg-ak-personal",
+    "CreateContainerIfMissing": true,
+    "KeyVaultName": "ak-personal-kv"
+  },
+  "Items": [
+    {
+      "Id": "VM-Objects",
+      "Enabled": true,
+      "Activity": "Execute",
+      "Application": "MigrationDemo",
+      "SourceServerName": "DESKTOP-SGA61QP\\DMF",
+      "SourceTrustServerCertificate": true,
+      "SourceListofDatabases": "MIGRDEMO",
+      "SQLAgentJobFilterCriteria": ".*",
+      "SQLAgentJobsMigrationFlag": "Yes",
+      "SQLLoginsMigrationFlag": "Yes",
+      "SQLLoginsMigrationScope": "Server",
+      "SQLAgentJobsMigrationScope": "Server",
+      "SQLOperatorsMigrationFlag": "Yes",
+      "SQLAlertsMigrationFlag": "Yes",
+      "SQLDBMailMigrationFlag": "Yes",
+      "JobOwnerUpnSuffix": "",
+      "SmtpServer": "smtp.example.com",
+      "SmtpPort": 587,
+      "TargetType": "SQLVM",
+      "TargetSqlAuthType": "SqlLogin",
+      "credential": "sql_target",
+      "SqlCredentialMode": "Configured",
+      "TargetTrustServerCertificate": true,
+      "TargetName": "akpersonalsqlvm",
+      "TargetSqlHost": "akpersonalsqlvm.centralus.cloudapp.azure.com",
+      "TargetSqlPort": 1433,
+      "ProvisionLogins": false,
+      "Logins": [
+        {
+          "Name": "dbmigration",
+          "Type": "SqlLogin",
+          "SecretName": "sql-dbmigration-pwd",
+          "AccessType": ["db_datareader"],
+          "ForcePasswordReset": false
+        },
+        {
+          "Name": "dbtestuser",
+          "Type": "SqlLogin",
+          "SecretName": "sql-dbtestuser-pwd",
+          "AccessType": ["db_datawriter"],
+          "ForcePasswordReset": false
+        },
+        {
+          "Name": "ak-personal-sqlmi",
+          "Type": "ManagedIdentity",
+          "AccessType": ["db_datareader"]
+        }
+      ]
+    },
+    {
+      "Id": "MI-Objects",
+      "Enabled": true,
+      "Activity": "Execute",
+      "Application": "MigrationDemo",
+      "SourceServerName": "DESKTOP-SGA61QP\\DMF",
+      "SourceTrustServerCertificate": true,
+      "SourceListofDatabases": "MIGRDEMO",
+      "SQLAgentJobFilterCriteria": ".*",
+      "SQLAgentJobsMigrationFlag": "Yes",
+      "SQLLoginsMigrationFlag": "Yes",
+      "SQLLoginsMigrationScope": "Server",
+      "SQLAgentJobsMigrationScope": "Server",
+      "SQLOperatorsMigrationFlag": "Yes",
+      "SQLAlertsMigrationFlag": "Yes",
+      "SQLDBMailMigrationFlag": "Yes",
+      "JobOwnerUpnSuffix": "",
+      "SmtpServer": "smtp.example.com",
+      "SmtpPort": 587,
+      "TargetType": "SQLMI",
+      "TargetSqlAuthType": "SqlLogin",
+      "credential": "sql_target",
+      "SqlCredentialMode": "Configured",
+      "TargetTrustServerCertificate": false,
+      "TargetName": "ak-personal-sqlmi",
+      "TargetSqlHost": "ak-personal-sqlmi.public.3c52841dc1d0.database.windows.net",
+      "TargetSqlPort": 3342,
+      "ProvisionLogins": true,
+      "Logins": [
+        {
+          "Name": "dbmigration",
+          "Type": "SqlLogin",
+          "SecretName": "sql-dbmigration-pwd",
+          "AccessType": ["db_datareader"],
+          "ForcePasswordReset": false
+        },
+        {
+          "Name": "dbtestuser",
+          "Type": "SqlLogin",
+          "SecretName": "sql-dbtestuser-pwd",
+          "AccessType": ["db_datawriter"],
+          "ForcePasswordReset": false
+        },
+        {
+          "Name": "ak-personal-sqlmi",
+          "Type": "ManagedIdentity",
+          "AccessType": ["db_datareader"]
+        }
+      ]
+    }
+  ]
+}

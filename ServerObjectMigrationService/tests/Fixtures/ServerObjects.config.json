@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 2,
+  "Common": {
+    "Enabled": true,
+    "Activity": "Generate",
+    "TenantId": "b7d7daca-8689-49f9-8a9b-d20adf81c78b",
+    "SubscriptionId": "cd7743ef-8ddc-4254-b715-2c79c8ab4126",
+    "SourceDomainSuffix": "",
+    "SQLDBMailMigrationFlag": "No",
+    "JobOwnerUpnSuffix": "",
+    "SmtpServer": "",
+    "SmtpPort": "",
+    "StorageAccountName": "akpersonalsa",
+    "StorageResourceGroup": "rg-ak-personal",
+    "CreateContainerIfMissing": true,
+    "KeyVaultName": "ak-personal-kv"
+  },
+  "Items": [
+    {
+      "Id": "VM-Objects",
+      "Enabled": true,
+      "Activity": "Generate",
+      "Application": "MigrationDemo",
+      "SourceServerName": "source\\instance",
+      "SourceListofDatabases": "MIGRDEMO,CDC_Director_PRO",
+      "SQLAgentJobFilterCriteria": ".*",
+      "SQLAgentJobsMigrationFlag": "Yes",
+      "SQLLoginsMigrationFlag": "Yes",
+      "SQLLoginsMigrationScope": "All",
+      "SQLOperatorsMigrationFlag": "Yes",
+      "SQLAlertsMigrationFlag": "Yes",
+      "SQLDBMailMigrationFlag": "No",
+      "TargetType": "SQLVM",
+      "TargetName": "akpersonalsqlvm",
+      "TargetSqlHost": "vm.example",
+      "TargetSqlPort": 1433,
+      "StorageContainer": "sqlobjects-akpersonalsqlvm",
+      "ProvisionLogins": false,
+      "Logins": [
+        { "Name": "dbmigration", "Type": "SqlLogin", "SecretName": "sql-dbmigration-pwd", "AccessType": ["db_datareader"], "ForcePasswordReset": false },
+        { "Name": "dbtestuser", "Type": "SqlLogin", "SecretName": "sql-dbtestuser-pwd", "AccessType": ["db_datawriter"], "ForcePasswordReset": false },
+        { "Name": "user@example.com", "Type": "EntraUser", "AccessType": ["db_datareader"] }
+      ]
+    },
+    {
+      "Id": "MI-Objects",
+      "Enabled": true,
+      "Activity": "Generate",
+      "Application": "MigrationDemo",
+      "SourceServerName": "source\\instance",
+      "SourceListofDatabases": "MIGRDEMO,CDC_Director_PRO",
+      "SQLAgentJobFilterCriteria": ".*",
+      "SQLAgentJobsMigrationFlag": "Yes",
+      "SQLLoginsMigrationFlag": "Yes",
+      "SQLLoginsMigrationScope": "All",
+      "SQLOperatorsMigrationFlag": "Yes",
+      "SQLAlertsMigrationFlag": "Yes",
+      "SQLDBMailMigrationFlag": "No",
+      "TargetType": "SQLMI",
+      "TargetName": "ak-personal-sqlmi",
+      "TargetSqlHost": "mi.example",
+      "TargetSqlPort": 3342,
+      "StorageContainer": "sqlobjects-ak-personal-sqlmi",
+      "ProvisionLogins": false,
+      "Logins": [
+        { "Name": "dbmigration", "Type": "SqlLogin", "SecretName": "sql-dbmigration-pwd", "AccessType": ["db_datareader"], "ForcePasswordReset": false },
+        { "Name": "dbtestuser", "Type": "SqlLogin", "SecretName": "sql-dbtestuser-pwd", "AccessType": ["db_datawriter"], "ForcePasswordReset": false },
+        { "Name": "user@example.com", "Type": "EntraUser", "AccessType": ["db_datareader"] }
+      ]
+    }
+  ]
+}

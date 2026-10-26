@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "Settings": {
+    "Overwrite": "true",
+    "InteractiveLogin": false,
+    "AzCopyPath": "C:\\AzCopy\\azcopy.exe",
+    "IncludeLogsAtSameTimestamp": false,
+    "TenantId": "b7d7daca-8689-49f9-8a9b-d20adf81c78b",
+    "SubscriptionId": "cd7743ef-8ddc-4254-b715-2c79c8ab4126",
+    "CheckLatestBak": "N",
+    "TimestampPattern": "",
+    "TimestampFormat": "",
+    "OutputJsonPath": ""
+  },
+  "Items": [
+    {
+      "SrcServerName": "DESKTOP-SGA61QP\\DMF",
+      "SrcDatabaseName": "MIGRDEMO",
+      "BackupRootPath": "C:\\Backups\\DESKTOP-SGA61QP$DMF\\MIGRDEMO",
+      "IsActive": "Y",
+      "BackupStorageAccountName": "akpersonalsa",
+      "BackupContainerName": "desktop-sga61qp-dmf-migrdemo"
+    }
+  ]
+}
