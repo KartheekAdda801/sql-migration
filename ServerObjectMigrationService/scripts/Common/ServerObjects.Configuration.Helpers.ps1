@@ -184,10 +184,13 @@ function Read-ServerObjectItems {
             throw "Unsupported Activity '$($Values.Activity)' on '$($Item.Id)'."
         }
         if ($Values.TargetType -notin @('SQLVM', 'SQLMI')) { throw "TargetType must be SQLVM or SQLMI on '$($Item.Id)'." }
-        if ($Values.TargetSqlAuthType -notin @('Auto', 'Windows', 'Entra', 'SqlLogin')) {
-            throw "TargetSqlAuthType must be Auto, Windows, Entra or SqlLogin on '$($Item.Id)'."
+        if ($Values.TargetSqlAuthType -eq 'Windows') {
+            throw "Replace TargetSqlAuthType 'Windows' with 'WindowsAD' on '$($Item.Id)'."
         }
-        if ($Values.TargetType -eq 'SQLMI' -and $Values.TargetSqlAuthType -eq 'Windows') {
+        if ($Values.TargetSqlAuthType -notin @('Auto', 'WindowsAD', 'Entra', 'SqlLogin')) {
+            throw "TargetSqlAuthType must be Auto, WindowsAD, Entra or SqlLogin on '$($Item.Id)'."
+        }
+        if ($Values.TargetType -eq 'SQLMI' -and $Values.TargetSqlAuthType -eq 'WindowsAD') {
             throw "Use Entra or SqlLogin target authentication for SQLMI item '$($Item.Id)'."
         }
         if ($Values.SqlCredentialMode -notin @('Interactive', 'Configured')) {

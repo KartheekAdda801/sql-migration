@@ -57,6 +57,33 @@ Describe 'Target SQL preflight and authentication' -Tag 'Unit' {
         }
         Should -Invoke Get-AzAccessToken -Times 1 -Exactly -ParameterFilter { $ResourceUrl -eq 'https://database.windows.net/' }
     }
+    It 'Uses the current Windows identity for WindowsAD VM checks without SQL credentials or Entra tokens' {
+        $Plan[0].Item.TargetSqlAuthType = 'WindowsAD'
+        $Plan[0].Item.credential = 'must-not-be-loaded'
+        $Credentials = @{}
+        Initialize-DMSRestorePlan -Plan @($Plan[0]) -SqlCredentials $Credentials
+        $Plan[0].RestoreState.Database.Exists | Should -BeFalse
+        $Credentials.Keys | Should -HaveCount 0
+        Should -Invoke Invoke-Sqlcmd -Times 1 -Exactly -ParameterFilter {
+            $ServerInstance -eq 'tcp:akpersonalsqlvm.centralus.cloudapp.azure.com,1433' -and
+            -not $PesterBoundParameters.ContainsKey('Credential') -and
+            -not $PesterBoundParameters.ContainsKey('AccessToken') -and $TrustServerCertificate
+        }
+        Should -Invoke Get-AzAccessToken -Times 0 -Exactly
+        Should -Invoke Get-Credential -Times 0 -Exactly
+    }
+    It 'Rejects WindowsAD for MI even if a caller bypasses configuration validation' {
+        $Plan[1].Item.TargetSqlAuthType = 'WindowsAD'
+        { Get-DMSTargetDatabase -Item $Plan[1].Item } | Should -Throw '*requires a SQLVM target*'
+        Should -Invoke Invoke-Sqlcmd -Times 0 -Exactly
+        Should -Invoke Get-AzAccessToken -Times 0 -Exactly
+    }
+    It 'Does not fall back to Windows authentication when an Entra VM login fails' {
+        $Plan[0].Item.TargetSqlAuthType = 'Entra'
+        Mock Invoke-Sqlcmd { throw "Login failed for user ''" }
+        { Get-DMSTargetDatabase -Item $Plan[0].Item } | Should -Throw "*Entra*Login failed*"
+        Should -Invoke Invoke-Sqlcmd -Times 1 -Exactly -ParameterFilter { $AccessToken -eq 'fake-token' }
+    }
     It 'Uses configured SQL login for SQLMI without changing managed-identity Blob restoration' {
         $Plan[1].Item.TargetSqlAuthType = 'SqlLogin'
         (Get-DMSTargetDatabase -Item $Plan[1].Item -SqlCredential $Credential).Exists | Should -BeFalse
@@ -147,10 +174,36 @@ Describe 'Target SQL preflight and authentication' -Tag 'Unit' {
         { Get-DMSTargetDatabase -Item $Plan[0].Item -SqlCredential $Credential } | Should -Throw '*System database*'
         Should -Invoke Invoke-Sqlcmd -Times 0 -Exactly
     }
-    It 'Fails without credentials rather than opening a credential dialog' {
-        { Initialize-DMSRestorePlan -Plan $Plan } | Should -Throw '*needs interactive SQL sign-in*'
+    It 'Records missing VM credentials and continues MI validation without opening a credential dialog' {
+        Initialize-DMSRestorePlan -Plan $Plan
+        $Plan[0].Result.Status | Should -Be 'Failed'
+        $Plan[0].Result.Error | Should -BeLike '*needs interactive SQL sign-in*'
+        $Plan[0].PSObject.Properties.Name | Should -Not -Contain 'RestoreState'
+        $Plan[1].RestoreState.Database.Exists | Should -BeFalse
         Should -Invoke Read-Host -Times 0 -Exactly
-        Should -Invoke Invoke-Sqlcmd -Times 0 -Exactly
+        Should -Invoke Invoke-Sqlcmd -Times 1 -Exactly -ParameterFilter { $AccessToken -eq 'fake-token' }
+    }
+    It 'Records a VM SQL failure and checks the next MI instead of treating the VM database as absent' {
+        $Plan[0].Item.TargetSqlAuthType = 'Entra'
+        Mock Invoke-Sqlcmd {
+            if ($ServerInstance -like '*akpersonalsqlvm*') { throw "Login failed for user ''" }
+            @{ CanView = 1; CanAlter = 1; DatabaseId = [DBNull]::Value; CreatedAt = [DBNull]::Value }
+        }
+        Initialize-DMSRestorePlan -Plan $Plan
+        $Plan[0].Result.Status | Should -Be 'Failed'
+        $Plan[0].Result.Error | Should -BeLike "*Target validation*Entra*Login failed*"
+        $Plan[0].PSObject.Properties.Name | Should -Not -Contain 'RestoreState'
+        $Plan[1].Result.Status | Should -Be 'Pending'
+        $Plan[1].RestoreState.Database.Exists | Should -BeFalse
+        Should -Invoke Invoke-Sqlcmd -Times 2 -Exactly
+        Should -Invoke Get-DMSItemInventory -Times 1 -Exactly -ParameterFilter { $Item.Id -eq 'MI-MIGRDEMO' }
+    }
+    It 'Does not query targets that already failed resource preflight' {
+        $Plan[0].Result.Status = 'Failed'
+        $Plan[0].Result.Error = 'Original resource error'
+        Initialize-DMSRestorePlan -Plan $Plan
+        $Plan[0].Result.Error | Should -Be 'Original resource error'
+        Should -Invoke Invoke-Sqlcmd -Times 1 -Exactly -ParameterFilter { $ServerInstance -like '*ak-personal-sqlmi*' }
     }
     It 'Loads a same-user encrypted SQL credential file without storing the password in JSON' {
         $Plan[0].Item.SqlCredentialPath = Join-Path $TestDrive 'credential.xml'
@@ -187,7 +240,10 @@ Describe 'Target SQL preflight and authentication' -Tag 'Unit' {
         Mock Test-DMSInteractiveSession { $true }
         Mock Invoke-Sqlcmd { @{ CanView = 1; CanAlter = 0; DatabaseId = 7; CreatedAt = '2026-10-23T01:00:00' } }
         Mock Read-Host { 'VM-MIGRDEMO' }
-        { Initialize-DMSRestorePlan -Plan $Plan -SqlCredentials @{ 'VM-MIGRDEMO' = $Credential } } | Should -Throw '*ALTER ANY DATABASE*'
+        Initialize-DMSRestorePlan -Plan $Plan -SqlCredentials @{ 'VM-MIGRDEMO' = $Credential }
+        $Plan[0].Result.Status | Should -Be 'Failed'
+        $Plan[0].Result.Error | Should -BeLike '*ALTER ANY DATABASE*'
+        $Plan[1].RestoreState.Skip | Should -BeTrue
     }
     It 'Prefers interactive SQL login over configured credentials' {
         Mock Test-DMSInteractiveSession { $true }

@@ -52,6 +52,7 @@ function Invoke-DMSRestoreBatch {
     $Jobs = @()
     try {
         foreach ($Entry in $Plan) {
+            if ($Entry.Result.Status -eq 'Failed') { continue }
             if ($Entry.PSObject.Properties['RestoreState'] -and $Entry.RestoreState.Skip) {
                 $Entry.Result.Status = 'SkippedExistingTarget'
                 Write-DMSPlanResults -Plan $ReportPlan

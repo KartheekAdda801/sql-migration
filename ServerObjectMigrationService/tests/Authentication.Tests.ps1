@@ -98,9 +98,31 @@ Describe 'Config-driven target SQL credentials' -Tag 'Unit' {
     It 'Requires resolved credentials for SQL authentication with no platform fallback' {
         { Get-ServerObjectTargetAuth -Item $Items[0] -TargetSqlAuthType SqlLogin } | Should -Throw '*no worker prompt or fallback*'
     }
-    It 'Rejects Windows authentication on MI while accepting interactive SQL mode in JSON' {
+    It 'Accepts explicit WindowsAD authentication on VM without credentials or Entra tokens' {
         $Json = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
-        $Json.Items[1] | Add-Member TargetSqlAuthType Windows
+        $Json.Items[0] | Add-Member TargetSqlAuthType WindowsAD
+        $Json | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Config
+        $Vm = @(Read-ServerObjectItems -Path $Config -Activity Execute)[0]
+        $Vm.TargetSqlAuthType | Should -Be WindowsAD
+        (Initialize-ServerObjectSqlCredentials -Items @($Vm) -ConfigPath $Config).Count | Should -Be 0
+        $Auth = Get-ServerObjectTargetAuth -Item $Vm -TargetSqlAuthType $Vm.TargetSqlAuthType
+        $Auth.ContainsKey('SqlCredential') | Should -BeFalse
+        $Auth.ContainsKey('TenantId') | Should -BeFalse
+        Should -Invoke Get-Credential -Times 0 -Exactly
+    }
+    It 'Rejects the old Windows configuration value with replacement guidance' {
+        $Json = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
+        $Json.Items[0] | Add-Member TargetSqlAuthType Windows
+        $Json | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Config
+        { Read-ServerObjectItems -Path $Config } | Should -Throw "*Replace TargetSqlAuthType 'Windows' with 'WindowsAD'*"
+    }
+    It 'Rejects WindowsAD in target authentication resolution for MI' {
+        { Get-ServerObjectTargetAuth -Item $Items[1] -TargetSqlAuthType WindowsAD } |
+            Should -Throw '*requires a SQLVM target*'
+    }
+    It 'Rejects WindowsAD authentication on MI while accepting interactive SQL mode in JSON' {
+        $Json = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
+        $Json.Items[1] | Add-Member TargetSqlAuthType WindowsAD
         $Json | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Config
         { Read-ServerObjectItems -Path $Config } | Should -Throw '*Use Entra or SqlLogin*'
         $Json.Items[1].TargetSqlAuthType = 'SqlLogin'

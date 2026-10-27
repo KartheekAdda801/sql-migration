@@ -14,16 +14,16 @@
   },
   "Items": [
     {
-      "SrcServerName": "sqlservermigvm",
+      "SrcServerName": "svrmigrsqlvm1",
       "SrcDatabaseName": "MIGRDEMO",
-      "BackupRootPath": "C:\\Backups\\sqlservermigvm\\MIGRDEMO",
+      "BackupRootPath": "\\\\svrmigrsqlvm1\\Backups\\svrmigrsqlvm1\\MIGRDEMO",
       "IsActive": "Y",
       "BackupStorageAccountName": "sqlmimigrationbackup"
     },
     {
-      "SrcServerName": "sqlservermigvm",
+      "SrcServerName": "svrmigrsqlvm1",
       "SrcDatabaseName": "DBAdmin",
-      "BackupRootPath": "C:\\Backups\\sqlservermigvm\\DBAdmin",
+      "BackupRootPath": "\\\\svrmigrsqlvm1\\Backups\\svrmigrsqlvm1\\DBAdmin",
       "IsActive": "Y",
       "BackupStorageAccountName": "sqlmimigrationbackup"
     }

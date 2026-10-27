@@ -48,6 +48,48 @@ Describe 'Process-isolated parallel submissions' -Tag 'Unit' {
         Should -Invoke Start-Job -Times 0 -Exactly
         Should -Invoke Write-DMSPlanResults -Times 0 -Exactly
     }
+    It 'Starts VM and MI workers concurrently and lets MI submit when VM fails' {
+        $Plan[0].Item.TargetSqlAuthType = 'WindowsAD'
+        $Fixture = Join-Path $TestDrive 'mixed-result-worker.ps1'
+        [IO.File]::WriteAllText((Join-Path $TestDrive 'expected-identity.txt'), [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+        @(
+            'function Disable-AzContextAutosave { param($Scope) }'
+            'function Import-AzContext { param($Path, $Scope) }'
+            'function Start-DMSItemRestore {'
+            '[CmdletBinding(SupportsShouldProcess)]param($Entry, $SqlCredential)'
+            '$Directory = Split-Path -Parent $PSCommandPath'
+            '$Expected = [IO.File]::ReadAllText((Join-Path $Directory "expected-identity.txt"))'
+            'if ([Security.Principal.WindowsIdentity]::GetCurrent().Name -ne $Expected) { throw "Windows executor identity changed" }'
+            '[IO.File]::WriteAllText((Join-Path $Directory ($Entry.Item.Id + ".concurrent")), "started")'
+            '$Deadline = [datetime]::UtcNow.AddSeconds(30)'
+            'while (@(Get-ChildItem -LiteralPath $Directory -Filter "*.concurrent").Count -lt 2) {'
+            'if ([datetime]::UtcNow -gt $Deadline) { throw "Restore workers were not concurrent" }'
+            'Start-Sleep -Milliseconds 50'
+            '}'
+            'if ($Entry.Item.TargetType -eq "SQLVM") {'
+            'if ($Entry.Item.TargetSqlAuthType -ne "WindowsAD") { throw "WindowsAD setting was not handed off" }'
+            'throw "VM SQL login failed"'
+            '}'
+            '[pscustomobject]@{ Status = "Submitted" }'
+            '}'
+        ) | Set-Content -LiteralPath $Fixture
+        Invoke-DMSRestoreBatch -Plan $Plan -ContextPath 'offline-context' -ReportPlan $Plan -EntryScript $Fixture
+        $Plan.Result.Status | Should -Be @('SubmissionUnverified', 'Submitted')
+        $Plan[0].Result.Error | Should -Be 'VM SQL login failed'
+        @(Get-ChildItem -LiteralPath $TestDrive -Filter '*.concurrent') | Should -HaveCount 2
+        @(Get-Job) | Where-Object { $_.State -eq 'Running' } | Should -HaveCount 0
+    }
+    It 'Does not launch workers for items that failed validation or overwrite their error' {
+        foreach ($Entry in $Plan) {
+            $Entry.Result.Status = 'Failed'
+            $Entry.Result.Error = 'Original SQL validation failure'
+        }
+        Mock Start-Job { throw 'Failed items must not start a worker' }
+        Invoke-DMSRestoreBatch -Plan $Plan -ContextPath 'offline-context' -ReportPlan $Plan
+        $Plan.Result.Status | Should -Be @('Failed', 'Failed')
+        $Plan.Result.Error | Should -Be @('Original SQL validation failure', 'Original SQL validation failure')
+        Should -Invoke Start-Job -Times 0 -Exactly
+    }
     It 'Rejects batches larger than 10 before starting any job' {
         Mock Start-Job { throw 'Unexpected worker launch' }
         { Invoke-DMSRestoreBatch -Plan (@($Plan[0]) * 11) -ContextPath 'offline-fixture' -ReportPlan $Plan } | Should -Throw '*cannot exceed 10*'

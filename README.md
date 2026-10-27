@@ -106,6 +106,7 @@ above. The following boundaries apply to those workflows.
 ```text
 SQLMigration\
 |-- README.md                          Project entry point and examples
+|-- references\                        Migration reference screenshots
 |-- Prerequisites\
 |   |-- README.md                      Installation, authentication, permissions
 |   |-- Install-MigrationPrerequisites.ps1
@@ -131,6 +132,82 @@ SQLMigration\
 
 Runtime output directories are created as needed. Keep each package's Common
 helpers with its entry-point scripts; neither package imports the other's helpers.
+
+## Reference images
+
+### SQL MI post cutover
+
+Azure portal migration details showing MIGRDEMO succeeded after SQL MI cutover.
+
+![SQL MI post cutover showing a succeeded MIGRDEMO migration](references/sql-mi-post-cutover.png)
+
+### DMS project creation
+
+Azure portal DMS service overview showing SQL VM migration entries.
+
+![DMS project creation showing the service overview and SQL VM migrations](references/dms-project-creation.png)
+
+### DMS ReadyForCutover stage
+
+Azure portal showing MIGRDEMO and DBAdmin SQL VM migrations ready for cutover.
+This stage is not completion: freeze source writes, upload and verify the final
+log backups, then perform the approved cutover.
+
+![DMS SQL VM migrations for MIGRDEMO and DBAdmin showing Ready for cutover](references/dms-ready-for-cutover.png)
+
+### DMS Restore Cutover Stage
+
+MIGRDEMO migration details showing Ready for cutover and all available backups
+restored to the SQL VM target. This status does not mean cutover has completed.
+
+![DMS MIGRDEMO restore details showing Ready for cutover and all backups restored](references/dms-restore-cutover-stage.png)
+
+The Complete cutover pane shows zero log backups pending restore and the final
+confirmation. Before confirming, stop source writes, create and upload the final
+transaction log backup, and verify it has been restored. Confirm that no
+additional log backups remain to provide.
+
+![DMS Complete cutover pane showing zero pending log backups and the final confirmation](references/dms-restore-cutover-confirmation.png)
+
+### DMS SQL VM post cutover
+
+Azure portal showing the MIGRDEMO migration to SQL VM target `sqlservermigvm`
+with status Succeeded after cutover and all backups restored.
+
+![DMS SQL VM post cutover showing a succeeded MIGRDEMO migration and all backups restored](references/dms-sql-vm-post-cutover.png)
+
+### Server properties - Windows + SQL Auth
+
+SSMS Server Properties showing SQL Server and Windows Authentication mode (mixed
+mode), which supports SQL logins alongside Windows authentication. Restart the
+SQL Server service after changing the authentication mode.
+
+![Server Properties Security page with SQL Server and Windows Authentication mode selected](references/server-properties-windows-sql-auth.png)
+
+### Server-Domain-Join (SQL VM Targets)
+
+Server Manager showing `sqlservermigvm` joined to the `sqlmig.test` domain.
+Domain membership supports Windows AD authentication; SQL Server logins and
+permissions must still be configured separately.
+
+![Server Manager Local Server properties showing sqlservermigvm joined to sqlmig.test](references/server-domain-join-sql-vm-targets.png)
+
+### Blob containers for migration artifacts
+
+Azure portal showing private containers in `sqlmimigrationbackup`, including
+database backup containers `svrmigrsqlvm1-dbadmin` and `svrmigrsqlvm1-migrdemo`,
+and server-object artifact containers `svrmigrsqlvm1-sqlobjects-sqlmi` and
+`svrmigrsqlvm1-sqlobjects-sqlvm`.
+
+![Azure Blob containers for database backups and SQL MI and SQL VM server-object artifacts](references/blob-containers-migration-artifacts.png)
+
+### SQL Server Object Artifacts in Blob Container
+
+Azure portal showing the `svrmigrsqlvm1-sqlobjects-sqlvm` container with
+`SQLAgentJobs`, `SQLAlerts`, `SQLDBMail`, `SQLLogins`, and `SQLOperators`
+artifact folders, alongside `manifest.json`.
+
+![SQL Server object artifact folders and manifest in the SQL VM Blob container](references/sql-server-object-artifacts-blob-container.png)
 
 ## Prerequisites
 

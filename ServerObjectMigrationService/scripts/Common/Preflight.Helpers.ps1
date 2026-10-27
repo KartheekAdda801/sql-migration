@@ -8,14 +8,14 @@ function Get-ServerObjectTargetAuth {
     param([Parameter(Mandatory)][object]$Item, [string]$TargetSqlAuthType = 'Auto',
         [bool]$TrustServerCertificate = $false, [pscredential]$SqlCredential)
     $Type = $TargetSqlAuthType
-    if ($Type -eq 'Auto') { $Type = if ($Item.TargetType -eq 'SQLVM') { 'Windows' } else { 'Entra' } }
+    if ($Type -eq 'Auto') { $Type = if ($Item.TargetType -eq 'SQLVM') { 'WindowsAD' } else { 'Entra' } }
     $Auth = @{ TrustServerCertificate = $TrustServerCertificate }
     switch ($Type) {
         SqlLogin {
             if (-not $SqlCredential) { throw "SQL authentication requires a resolved credential for target '$($Item.TargetType)'; no worker prompt or fallback is allowed." }
             $Auth.SqlCredential = $SqlCredential
         }
-        Windows {
+        WindowsAD {
             if ($Item.TargetType -ne 'SQLVM') { throw 'Windows integrated authentication requires a SQLVM target.' }
         }
         Entra { $Auth.TenantId = $Item.TenantId; $Auth.SubscriptionId = $Item.SubscriptionId }

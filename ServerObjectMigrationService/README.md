@@ -212,7 +212,7 @@ direct `ProvisionLogins`. `_All` is executable after database restoration.
 | `SourceTrustServerCertificate` | Boolean, default `false`; development-only source certificate-validation override, configurable in Common or per item |
 | `TargetTrustServerCertificate` | Boolean, default `false`; explicit development-only target TLS validation override for replay, provisioning, and their preflights; encryption remains required |
 | `TargetType`, `TargetName`, `TargetSqlHost`, `TargetSqlPort` | Platform, target identity, endpoint |
-| `TargetSqlAuthType` | `Auto` (default: Windows for VM, Entra for MI), `Windows` (VM only), `Entra`, or `SqlLogin` |
+| `TargetSqlAuthType` | `Auto` (default: WindowsAD for VM, Entra for MI), `WindowsAD` (VM only), `Entra`, or `SqlLogin` |
 | `credential` | Named administrative SQL credential in `password.local.json` beside the selected config; takes precedence over interactive/file/environment modes |
 | `SqlCredentialMode`, `SqlUserName` | `Interactive` (default) prompts in the launcher; `Configured` avoids prompting; optional username for the prompt or environment mode |
 | `SqlCredentialPath`, `SqlPasswordEnvironmentVariable` | Alternative encrypted PSCredential file, relative to config, or password environment variable paired with `SqlUserName` |

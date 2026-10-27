@@ -161,7 +161,7 @@ Describe 'WindowsAD private preflight target checks' -Tag 'Unit' {
         Mock Invoke-ServerObjectPreflightQuery {}
     }
     It 'Checks the Windows account in master even in Server-only scope with <Authentication> connection auth' -ForEach @(
-        @{ Authentication = 'Windows' },
+        @{ Authentication = 'WindowsAD' },
         @{ Authentication = 'Entra' },
         @{ Authentication = 'SqlLogin' }
     ) {
@@ -269,7 +269,7 @@ Describe 'WindowsAD target default-domain failures in the worker' -Tag 'Unit' {
             $Item = Read-ServerObjectItems -Path (Join-Path $PSScriptRoot 'Fixtures\ServerObjects.config.json') -ItemId VM-Objects
             $Item.Logins = @($Item.Logins | Where-Object Type -eq WindowsAD)
             $rows = @(Get-ServerObjectProvisioningItems -Item $Item)
-            $TargetSqlAuthType = 'Windows'
+            $TargetSqlAuthType = 'WindowsAD'
             $SqlCredential = $null
             $SqlPort = 1433
             $ServerOnly = $false

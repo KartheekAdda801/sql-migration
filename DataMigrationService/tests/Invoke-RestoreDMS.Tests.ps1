@@ -39,6 +39,16 @@ BeforeAll {
 
 Describe 'Item-based DMS configuration inheritance' -Tag 'Unit' {
     BeforeEach { $Shared = Read-ServiceConfiguration -Path $ReferencePath }
+    It 'Supports explicit WindowsAD for VM while leaving MI on Entra and Blob authentication unchanged' {
+        $Shared.Items[0].TargetSqlAuthType = 'WindowsAD'
+        $Items = @(Resolve-DMSConfigurationItems $Shared)
+        $Items.TargetSqlAuthType | Should -Be @('WindowsAD', 'Entra')
+        $Items.BlobAuthType | Should -Be @('AccountKey', 'ManagedIdentity')
+    }
+    It 'Rejects WindowsAD authentication for MI' {
+        $Shared.Items[1].TargetSqlAuthType = 'WindowsAD'
+        { Resolve-DMSConfigurationItems $Shared } | Should -Throw '*WindowsAD*supported only for SQLVM*'
+    }
     It 'Rejects obsolete container fields in Common or Items, including blank overrides' -ForEach @(
         @{ Section = 'Common'; Field = 'BackupStorageContainerName'; Value = '' }
         @{ Section = 'Items'; Field = 'BackupStorageContainerName'; Value = 'old-container' }
@@ -327,6 +337,25 @@ Describe 'Configured DMS SQL service creation' -Tag 'Unit' {
             Should -Throw '*could not be verified*'
         Should -Invoke Invoke-DMSRestoreQueue -Times 0 -Exactly
     }
+    It 'Continues independent MI service initialization and restore when VM service creation fails' {
+        $Plan[0].Item.DMSServiceName = 'a-vm-dms'
+        $Plan[1].Item.DMSServiceName = 'z-mi-dms'
+        Mock New-AzDataMigrationSqlService {
+            if ($Name -eq 'a-vm-dms') { throw 'VM DMS denied' }
+            $script:Services += [pscustomobject]@{
+                Name = $Name; Location = $Location; ProvisioningState = 'Succeeded'; Id = 'mi-service-id'
+            }
+        }
+        Mock Invoke-DMSRestoreQueue { foreach ($Entry in $Plan) { $Entry.Result.Status = 'Succeeded' } }
+        { Invoke-DMSPreparedPlan -Plan $Plan -MaxConcurrentRestores 10 -MaxConcurrentCutover 5 } |
+            Should -Throw '*VM DMS denied*'
+        $Plan[0].Result.Status | Should -Be 'Failed'
+        $Plan[1].Result.Status | Should -Be 'Succeeded'
+        Should -Invoke New-AzDataMigrationSqlService -Times 2 -Exactly
+        Should -Invoke Invoke-DMSRestoreQueue -Times 1 -Exactly -ParameterFilter {
+            $Plan.Count -eq 1 -and $Plan[0].Item.Id -eq 'MI-MIGRDEMO' -and $ReportPlan.Count -eq 2
+        }
+    }
     It 'Does not create resources when the service helper is previewed directly' {
         Initialize-DMSRestoreServices -Plan $Plan -WhatIf
         Should -Invoke New-AzDataMigrationSqlService -Times 0 -Exactly
@@ -344,6 +373,42 @@ Describe 'Configured DMS SQL service creation' -Tag 'Unit' {
         Initialize-DMSRestoreServices -Plan $Plan
         Should -Invoke Get-AzDataMigrationSqlService -Times 0 -Exactly
         Should -Invoke New-AzDataMigrationSqlService -Times 0 -Exactly
+    }
+}
+
+Describe 'SQL validation failure isolation through the restore workflow' -Tag 'Unit' {
+    It 'Records a first VM login failure, submits the next MI, and persists both outcomes before reporting failure' {
+        Mock Write-Host {}
+        Mock Write-Warning {}
+        Mock Invoke-DataMigrationPreflight {}
+        Mock Get-DMSTargetDatabase {
+            if ($Item.TargetType -eq 'SQLVM') { throw "SQL VM login failed for user ''" }
+            [pscustomobject]@{ Exists = $false; DatabaseId = 0; CreatedAt = ''; CanAlter = $true }
+        }
+        Mock Get-DMSItemInventory { @() }
+        Mock Initialize-DMSRestoreServices {}
+        Mock New-DMSRunDirectory { Join-Path $TestDrive 'sql-isolation-run' }
+        Mock Invoke-DMSRun {
+            Invoke-DMSPreparedPlan -Plan $Plan -MaxConcurrentRestores $MaxConcurrentRestores `
+                -MaxConcurrentCutover $MaxConcurrentCutover -SqlCredentials $SqlCredentials -ContextPath 'offline-context'
+        }
+        Mock Invoke-DMSRestoreQueue { foreach ($Entry in $Plan) { $Entry.Result.Status = 'Succeeded' } }
+        $Config = Read-ServiceConfiguration $ReferencePath
+        $ReportPath = Join-Path $TestDrive 'mixed-sql-results.json'
+        $Config.Common.OutputJsonPath = $ReportPath
+        $Config.Common.ExportCsvPath = Join-Path $TestDrive 'mixed-sql-results.csv'
+        $ConfigPath = Join-Path $TestDrive 'mixed-sql-config.json'
+        $Config | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ConfigPath
+        { Invoke-DMSConfiguredActivity -ConfigPath $ConfigPath -Activity Restore } |
+            Should -Throw '*VM-MIGRDEMO*Target validation*SQL VM login failed*'
+        Should -Invoke Get-DMSTargetDatabase -Times 2 -Exactly
+        Should -Invoke Invoke-DMSRestoreQueue -Times 1 -Exactly -ParameterFilter {
+            $Plan.Count -eq 1 -and $Plan[0].Item.Id -eq 'MI-MIGRDEMO'
+        }
+        $Report = Get-Content -LiteralPath $ReportPath -Raw | ConvertFrom-Json
+        $Report.status | Should -Be 'Failed'
+        $Report.results.Status | Should -Be @('Failed', 'Succeeded')
+        $Report.results[0].Error | Should -BeLike '*Target validation*SQL VM login failed*'
     }
 }
 
@@ -387,13 +452,56 @@ Describe 'Mixed-target workflow safeguards' -Tag 'Unit' {
         { Invoke-DMSConfiguredActivity -ConfigPath $Path -WhatIf } | Should -Throw '*overwrite the local credential file*'
         Should -Invoke Invoke-DataMigrationPreflight -Times 0 -Exactly
     }
-    It 'Aborts before any work if the last item fails preflight' {
+    It 'Continues the healthy VM restore when MI preflight fails and reports an overall failure' {
         Mock Invoke-DataMigrationPreflight { if ($Operation -like '*SQLMI') { throw 'MI denied' } }
+        Mock Write-Warning {}
         $Shared | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Path
         { Invoke-DMSConfiguredActivity -ConfigPath $Path -Activity Restore -Confirm:$false } | Should -Throw '*MI denied*'
+        Should -Invoke Invoke-DataMigrationPreflight -Times 2 -Exactly
+        Should -Invoke Invoke-DMSRestoreQueue -Times 1 -Exactly -ParameterFilter {
+            $Plan.Count -eq 1 -and $Plan[0].Item.Id -eq 'VM-MIGRDEMO' -and
+            $ReportPlan.Count -eq 2 -and $ReportPlan[1].Result.Status -eq 'Failed'
+        }
+        Should -Invoke Initialize-DMSRestoreServices -Times 1 -Exactly -ParameterFilter { $Plan.Count -eq 1 }
+    }
+    It 'Continues MI when the first VM resource preflight fails' {
+        Mock Invoke-DataMigrationPreflight { if ($Operation -like '*SQLVM') { throw 'VM unavailable' } }
+        Mock Write-Warning {}
+        $Shared | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Path
+        { Invoke-DMSConfiguredActivity -ConfigPath $Path -Activity Restore } | Should -Throw '*VM unavailable*'
+        Should -Invoke Invoke-DataMigrationPreflight -Times 2 -Exactly
+        Should -Invoke Invoke-DMSRestoreQueue -Times 1 -Exactly -ParameterFilter {
+            $Plan.Count -eq 1 -and $Plan[0].Item.Id -eq 'MI-MIGRDEMO' -and
+            $ReportPlan[0].Result.Error -like '*Preflight*VM unavailable*'
+        }
+    }
+    It 'Attempts all restore previews and reports failures without creating output or starting jobs' {
+        Mock Invoke-DataMigrationPreflight { if ($Operation -like '*SQLVM') { throw 'VM preview denied' } }
+        Mock Write-Warning {}
+        $Shared | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Path
+        { Invoke-DMSConfiguredActivity -ConfigPath $Path -Activity Restore -WhatIf } | Should -Throw '*Restore preview failed*VM preview denied*'
+        Should -Invoke Invoke-DataMigrationPreflight -Times 2 -Exactly
+        Should -Invoke Initialize-DMSRestoreServices -Times 0 -Exactly
         Should -Invoke Invoke-DMSRestoreQueue -Times 0 -Exactly
         Should -Invoke Write-DMSPlanResults -Times 0 -Exactly
-        Should -Invoke Initialize-DMSRestoreServices -Times 0 -Exactly
+        Should -Invoke New-DMSRunDirectory -Times 0 -Exactly
+    }
+    It 'Writes failure reports without launching execution when every restore fails preflight' {
+        Mock Invoke-DataMigrationPreflight { throw 'No target access' }
+        Mock Write-Warning {}
+        $Shared | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Path
+        { Invoke-DMSConfiguredActivity -ConfigPath $Path -Activity Restore } | Should -Throw '*All selected restore items failed validation*'
+        Should -Invoke Write-DMSPlanResults -Times 1 -Exactly -ParameterFilter {
+            @($Plan | Where-Object { $_.Result.Status -eq 'Failed' }).Count -eq 2
+        }
+        Should -Invoke Invoke-DMSRun -Times 0 -Exactly
+        Should -Invoke Invoke-DMSRestoreQueue -Times 0 -Exactly
+    }
+    It 'Preserves all-or-nothing preflight for explicit cutover' {
+        Mock Invoke-DataMigrationPreflight { throw 'Cutover not ready' }
+        $Shared | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Path
+        { Invoke-DMSConfiguredActivity -ConfigPath $Path -Activity Cutover } | Should -Throw '*Cutover not ready*'
+        Should -Invoke Invoke-DMSRun -Times 0 -Exactly
     }
     It 'Dispatches configured Cutover for both target types without a CLI activity override' {
         $Shared.Common.Activity = 'Cutover'
@@ -930,6 +1038,22 @@ Describe 'Scoped workflow results' -Tag 'Unit' {
         $Json.status | Should -Be 'InProgress'
         $Json.completedAt | Should -BeNullOrEmpty
         @(Import-Csv -LiteralPath $Shared.Common.ExportCsvPath) | Should -HaveCount 2
+    }
+    It 'Keeps a partial-failure report in progress until the healthy restore completes' {
+        $Plan[0].Result.Status = 'Failed'
+        $Plan[0].Result.Error = 'VM login failed'
+        $Plan[1].Result.Status = 'Monitoring'
+        Write-DMSPlanResults -Plan $Plan
+        $Json = Get-Content -LiteralPath $Shared.Common.OutputJsonPath -Raw | ConvertFrom-Json
+        $Json.status | Should -Be 'InProgress'
+        $Json.completedAt | Should -BeNullOrEmpty
+        $Json.results[0].Error | Should -Be 'VM login failed'
+        $Plan[1].Result.Status = 'Succeeded'
+        Write-DMSPlanResults -Plan $Plan
+        $Json = Get-Content -LiteralPath $Shared.Common.OutputJsonPath -Raw | ConvertFrom-Json
+        $Json.status | Should -Be 'Failed'
+        $Json.completedAt | Should -Not -BeNullOrEmpty
+        $Json.results.Status | Should -Be @('Failed', 'Succeeded')
     }
     It 'Updates real JSON and CSV reports repeatedly under an inherited Confirm preference without prompts' {
         & {

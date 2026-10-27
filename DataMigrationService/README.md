@@ -146,7 +146,7 @@ Its supported range is 1 through 10.
 | `TargetType`, `TargetName`, `TargetResourceGroup` | SQLVM or SQLMI and its Azure resource name/group |
 | `TargetSqlHost`, `TargetSqlPort` | Executor SQL hostname and TCP port for either target type; host required for Restore, without `tcp:` or port suffix; item overrides Common, port defaults 1433 only if neither supplies it |
 | `SqlCredentialPath` | DPAPI-encrypted PSCredential file for SQL-login access on either target; Interactive mode prefers login entry |
-| `TargetSqlAuthType` | SQL endpoint authentication: SqlLogin or Entra; blank defaults to SqlLogin for SQLVM and Entra for SQLMI; independent of BlobAuthType |
+| `TargetSqlAuthType` | SQL endpoint authentication: SqlLogin or Entra for either target, WindowsAD for SQLVM only; blank defaults to SqlLogin for SQLVM and Entra for SQLMI; independent of BlobAuthType |
 | `credential` | Named SQL login in password.local.json beside the selected configuration; item overrides Common; explicit reference loads without a login prompt |
 | `SqlCredentialMode` | Interactive (default) prefers login entry; Configured loads credential references without a login prompt, while retaining replacement approval |
 | `SqlUserName`, `SqlPasswordEnvironmentVariable` | Alternative configured SQL login: username and the name of a password environment variable, never the password itself |
@@ -223,7 +223,11 @@ For exceptions, set the item's `Activity`, such as Status for one database and
 Restore for another. An explicit CLI `-Activity` overrides all selected items
 for that invocation, without editing the file.
 
-The runner preflights every selected item before starting any work. It then
+The runner preflights selected items before starting migrations. Restore resource,
+credential, and SQL-query failures are recorded per item; other valid restore
+items continue. Failed items are excluded from service creation and submission,
+but remain in the reports. Configuration/schema errors and non-Restore preflight
+failures still stop launch. It then
 runs Status, Cutover, and Remove activities, followed by the global Restore
 submissions and restore polling, then automatic Monitor polling. Monitor displays
 all selected monitor mappings in one table. A separate status/cutover command can
@@ -236,33 +240,42 @@ and port. SQLVM defaults to SQL login authentication; SQLMI defaults to an Entra
 SQL token for the signed-in Azure identity. Set `TargetSqlAuthType="SqlLogin"`
 to use SQL credentials for either or both target types. This does not change
 MI managed-identity Blob restore authentication.
-Both require `VIEW ANY DATABASE` so a hidden
+All SQL connection modes require `VIEW ANY DATABASE` so a hidden
 database cannot be mistaken for an absent database.
+
+For a domain-joined SQL VM, set the item's `TargetSqlAuthType` to `WindowsAD`
+to use Windows integrated authentication as the account running PowerShell.
+Run PowerShell under the same authorized domain account used for SSMS, such as
+`DOMAIN\user`. No SQL credential or Entra SQL token is used in this mode.
+WindowsAD requires a Windows executor and is not supported for SQL MI. Background
+and parallel workers inherit the executor's Windows identity; remote sessions
+still need working Windows authentication/delegation to reach the SQL VM.
 
 Complete the externally managed
 [access and infrastructure prerequisites](../Prerequisites/README.md#access-and-infrastructure-managed-outside-scripts),
 including [SQL VM Entra setup](../Prerequisites/README.md#sql-vm-entra-authentication-prerequisites)
 and [SQL MI identity setup](../Prerequisites/README.md#sql-mi-identity-and-connection-prerequisites)
 when applicable. These scripts do not enable Entra authentication, assign
-Directory Readers, create the operator's initial SQL login, or provision DMS,
-networking, and target infrastructure.
+Directory Readers, create the operator's initial SQL login, or provision
+networking and target infrastructure. Missing configured DMS services are created
+during live Restore as described below.
 
 Keep these authentication layers separate:
 
-| Layer | SQL-login mode | Entra mode |
-|-------|----------------|------------|
-| Azure resource operations and executor Blob discovery | Signed-in Azure context | Signed-in Azure context |
-| Executor SQL checks and SQL VM replacement query | Named/interactive SQL credential | SQL access token for the signed-in Azure user |
-| DMS service-side Blob access | VM AccountKey; MI ManagedIdentity by default | Unchanged; independent of SQL authentication |
+| Layer | SQL-login mode | Entra mode | WindowsAD mode (SQLVM only) |
+|-------|----------------|------------|----------------------------|
+| Azure resource operations and executor Blob discovery | Signed-in Azure context | Signed-in Azure context | Signed-in Azure context |
+| Executor SQL checks and SQL VM replacement query | Named/interactive SQL credential | SQL access token for the signed-in Azure user | Current Windows domain identity |
+| DMS service-side Blob access | VM AccountKey; MI ManagedIdentity by default | Unchanged; independent of SQL authentication | VM AccountKey |
 
-The operational config currently selects `TargetSqlAuthType="Entra"` for both
-MIGRDEMO mappings. SQL connections use an Azure SQL access token for the active
-Azure context; sign in as the intended user before launching. The retained
-`"credential": "sql_target"` reference is ignored in Entra mode, with no SQL-login
-fallback. Existing-target replacement still requires explicit approval.
+The operational config selects `WindowsAD` for the VM mappings and `Entra` for MI.
+VM checks use the PowerShell executor's Windows identity; MI checks use an Azure
+SQL access token for the active Azure context. `credential` is used only in
+SqlLogin mode. There is no fallback between authentication methods.
+Existing-target replacement still requires explicit approval.
 
-Both operational and example items include blank `TargetTrustServerCertificate`,
-`TargetSqlAuthType`, and `credential` fields. A nonblank item value overrides
+Operational and example items can override `TargetTrustServerCertificate`,
+`TargetSqlAuthType`, and `credential`. A nonblank item value overrides
 Common; blank values inherit. Use the JSON boolean `false`, not `"false"`, to
 override a common certificate-trust setting of `true`.
 
@@ -505,7 +518,7 @@ targets. Other mappings still run. Unknown IDs stop the launch. In unattended
 mode, existing targets are skipped; they are never replaced without this approval.
 WhatIf checks existence but never requests replacement approval or deletes anything.
 
-The commands are identical for SQL login and Entra once preflight passes:
+The commands are identical for SqlLogin, Entra, and VM WindowsAD once preflight passes:
 
 ```powershell
 $ConfigPath = '.\DataMigrationService\config\Invoke-RestoreDMS.config.json'
@@ -644,7 +657,8 @@ context races. Before submitting restores, the workflow reuses each configured
 DMS SQL service or creates it if missing, using `DMSServiceName`, `DMSResourceGroup`,
 `SubscriptionId`, and `Location`. Items sharing the same service create it only
 once before the concurrent submission batches. Conflicting locations for a shared
-service are rejected. Service creation failure stops restore submission.
+service are rejected. Service initialization failures block the affected service's
+items; independent services and their restores continue.
 
 One item's creation, restore, or monitoring failure is recorded without blocking
 the other selected restores. The final workflow is failed if any item has failed
@@ -724,8 +738,8 @@ The executor needs service-management permissions, such as Contributor on the DM
 resource group; Storage Blob Data Contributor alone does not grant these permissions.
 Read-only preflight and `-WhatIf` report planned service creation without creating
 resources. Status, Monitor, Cutover, and Remove never create services. Access,
-network, resource-group, and provisioning errors stop the workflow rather than
-being treated as a missing service. Existing services are not reconfigured.
+network, resource-group, and provisioning errors fail the affected restore items
+rather than being treated as a missing service. Existing services are not reconfigured.
 Blob-source restore does not require a self-hosted integration runtime to report
 Online; network-share workflows have different requirements.
 Preflight checks resource fields, duplicate target databases, module
@@ -853,6 +867,11 @@ Report `status`, per-item `Status`, and Azure `MigrationStatus` describe differe
 things. For a Status activity, local `Succeeded` means inventory was read, not
 that the database migration finished. Require the relevant Azure terminal state
 and target validation before declaring a restore complete.
+An aggregate report remains `InProgress` with no `completedAt` while healthy
+items are pending, submitting, or monitoring, even if another item has failed.
+The failed item's status and error remain visible. Once the remaining work
+finishes, the aggregate becomes `Failed` if any item failed. An orchestration
+error that stops the run also marks the report `Failed`.
 
 An authentication failure can look like this illustrative excerpt:
 
@@ -860,10 +879,16 @@ An authentication failure can look like this illustrative excerpt:
 SQL connection/query failed for item 'VM-MIGRDEMO' at 'tcp:akpersonalsqlvm.centralus.cloudapp.azure.com,1433' using 'Entra' authentication: Login failed for user ''.
 ```
 
-Stop and check account/tenant, SQL VM Entra enablement, managed-identity Graph
-permissions, and the SQL login grants. An auth failure during preflight starts
-no new migrations in that invocation; it does not cancel migrations already
-running in Azure.
+Check the selected authentication method, account/tenant, SQL VM Entra enablement,
+managed-identity Graph permissions, and SQL login grants. A successful
+`Test-NetConnection` proves TCP reachability only. An SSMS Windows-domain login
+does not prove Entra access; choose `WindowsAD` for that domain identity on SQL VM.
+An authentication failure prevents that item's submission, while other valid
+items continue through concurrent submission and monitoring. The overall run
+reports failure if any item fails, preserving successful item results. Existing
+Azure migrations are not canceled. Validation checks run before submission;
+`MaxConcurrentRestores` controls the independent submission workers, not those
+read-only checks.
 
 ## Single entry point and validation
 

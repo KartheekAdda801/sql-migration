@@ -25,7 +25,7 @@ function Invoke-ServerObjectProvisioning {
             -ServerOnly:($Item.SQLLoginsMigrationScope -eq 'Server') `
             -TargetTrustServerCertificate $Item.TargetTrustServerCertificate `
             -TargetSqlAuthType $Item.TargetSqlAuthType -SqlCredential $SqlCredential `
-            -UseWindowsAuthentication:($Item.TargetSqlAuthType -eq 'Windows' -or
+            -UseWindowsAuthentication:($Item.TargetSqlAuthType -eq 'WindowsAD' -or
                 ($Item.TargetSqlAuthType -eq 'Auto' -and $Item.TargetType -eq 'SQLVM')) -Confirm:$false | Out-Host
     }
     finally { Remove-Item -LiteralPath $Config -Force -Confirm:$false -ErrorAction Stop }

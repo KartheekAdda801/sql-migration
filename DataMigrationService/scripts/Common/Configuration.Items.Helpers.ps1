@@ -72,7 +72,10 @@ function Resolve-DMSConfigurationItems {
         if ($Values.TargetType -notin @('SQLVM', 'SQLMI')) { throw "Item '$($Source.Id)': TargetType must be SQLVM or SQLMI." }
         $Values.TargetType = $Values.TargetType.ToUpperInvariant()
         if (-not $Values.TargetSqlAuthType) { $Values.TargetSqlAuthType = if ($Values.TargetType -eq 'SQLMI') { 'Entra' } else { 'SqlLogin' } }
-        if ($Values.TargetSqlAuthType -notin @('SqlLogin', 'Entra')) { throw "Item '$($Source.Id)': TargetSqlAuthType must be SqlLogin or Entra." }
+        if ($Values.TargetSqlAuthType -notin @('SqlLogin', 'Entra', 'WindowsAD')) { throw "Item '$($Source.Id)': TargetSqlAuthType must be SqlLogin, Entra, or WindowsAD." }
+        if ($Values.TargetSqlAuthType -eq 'WindowsAD' -and $Values.TargetType -ne 'SQLVM') {
+            throw "Item '$($Source.Id)': WindowsAD target authentication is supported only for SQLVM."
+        }
         if ($Values.SqlCredentialMode -notin @('Interactive', 'Configured')) { throw "Item '$($Source.Id)': SqlCredentialMode must be Interactive or Configured." }
         if ($Values.Activity -notin @('Restore', 'Status', 'Monitor', 'Cutover', 'Remove')) { throw "Item '$($Source.Id)': invalid Activity '$($Values.Activity)'." }
         foreach ($Name in @('BackupStorageResourceGroup', 'TargetResourceGroup', 'DMSResourceGroup')) {

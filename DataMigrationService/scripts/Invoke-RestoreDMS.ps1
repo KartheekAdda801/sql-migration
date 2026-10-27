@@ -7,7 +7,10 @@
 .SYNOPSIS
     Run item-based SQL VM and SQL MI migrations using inherited common settings.
 .DESCRIPTION
-    Validates all selected database items before work. Live Restore creates missing
+    Validates selected items before work. Restore validation failures are recorded
+    per item; other valid restores continue and the final run reports any failures.
+    SQLVM target checks support SqlLogin, Entra, or WindowsAD (current Windows identity).
+    SQLMI target checks support SqlLogin or Entra. Live Restore creates missing
     configured SQL migration services before submitting database migrations.
     Migration submissions run
     in batches of up to 10 independent processes. Accepted restores continue in

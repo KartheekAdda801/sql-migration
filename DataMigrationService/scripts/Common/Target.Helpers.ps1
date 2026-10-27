@@ -13,18 +13,21 @@ function Invoke-DMSTargetQuery {
         AbortOnError = $true; DisableVariables = $true; DisableCommands = $true; ErrorAction = 'Stop'
         TrustServerCertificate = $Item.TargetTrustServerCertificate
     }
-    if ($Item.TargetSqlAuthType -notin @('SqlLogin', 'Entra')) { throw "Invalid TargetSqlAuthType for '$($Item.Id)'." }
+    if ($Item.TargetSqlAuthType -notin @('SqlLogin', 'Entra', 'WindowsAD')) { throw "Invalid TargetSqlAuthType for '$($Item.Id)'." }
     if ($Item.TargetSqlAuthType -eq 'SqlLogin') {
         if (-not $SqlCredential) { throw "Supply a SQL credential for '$($Item.Id)' through credential, SqlCredentials, or SqlCredentialPath." }
         $Arguments.Credential = $SqlCredential
     }
-    else {
+    elseif ($Item.TargetSqlAuthType -eq 'Entra') {
         $null = Set-AzContext -SubscriptionId $Item.SubscriptionId -Scope Process -WhatIf:$false -Confirm:$false -ErrorAction Stop
         $Token = (Get-AzAccessToken -ResourceUrl 'https://database.windows.net/' -ErrorAction Stop).Token
         if ($Token -is [securestring] -and (Get-Command Invoke-Sqlcmd).Parameters['AccessToken'].ParameterType -eq [string]) {
             $Token = [Net.NetworkCredential]::new('', $Token).Password
         }
         $Arguments.AccessToken = $Token
+    }
+    elseif ($Item.TargetType -ne 'SQLVM' -or -not $IsWindows) {
+        throw "WindowsAD authentication for '$($Item.Id)' requires a SQLVM target and a Windows executor."
     }
     try { Invoke-Sqlcmd @Arguments }
     catch {
@@ -123,33 +126,38 @@ function Initialize-DMSRestorePlan {
 
     $CredentialCache = @{}
     $Candidates = @(
-        foreach ($Entry in @($Plan | Where-Object { $_.Item.Activity -eq 'Restore' })) {
+        foreach ($Entry in @($Plan | Where-Object { $_.Item.Activity -eq 'Restore' -and $_.Result.Status -ne 'Failed' })) {
             $Item = $Entry.Item
-            if ($Item.TargetSqlAuthType -eq 'SqlLogin' -and -not $SqlCredentials.ContainsKey($Item.Id)) {
-                $Key = "$($Item.TargetSqlHost)|$($Item.TargetSqlPort)|$($Item.SqlUserName)|$($Item.SqlCredentialPath)|$($Item.SqlPasswordEnvironmentVariable)|$($Item.SqlCredentialMode)|$($Item.credential)|$CredentialFilePath"
-                if (-not $CredentialCache.ContainsKey($Key)) {
-                    $CredentialCache[$Key] = Get-DMSSqlCredential -Item $Item -NonInteractive:$NonInteractive -CredentialFilePath $CredentialFilePath
+            try {
+                if ($Item.TargetSqlAuthType -eq 'SqlLogin' -and -not $SqlCredentials.ContainsKey($Item.Id)) {
+                    $Key = "$($Item.TargetSqlHost)|$($Item.TargetSqlPort)|$($Item.SqlUserName)|$($Item.SqlCredentialPath)|$($Item.SqlPasswordEnvironmentVariable)|$($Item.SqlCredentialMode)|$($Item.credential)|$CredentialFilePath"
+                    if (-not $CredentialCache.ContainsKey($Key)) {
+                        $CredentialCache[$Key] = Get-DMSSqlCredential -Item $Item -NonInteractive:$NonInteractive -CredentialFilePath $CredentialFilePath
+                    }
+                    $SqlCredentials[$Item.Id] = $CredentialCache[$Key]
                 }
-                $SqlCredentials[$Item.Id] = $CredentialCache[$Key]
+                if ($SqlCredentials.ContainsKey($Item.Id) -and $SqlCredentials[$Item.Id] -isnot [pscredential]) {
+                    throw "SqlCredentials['$($Item.Id)'] must be a PSCredential."
+                }
+                $Database = Get-DMSTargetDatabase -Item $Item -SqlCredential $SqlCredentials[$Item.Id]
+                $Inventory = @(Get-DMSItemInventory -Item $Item)
+                if ($Inventory.Count -gt 1) { throw "Multiple migrations matched '$($Item.Id)'." }
+                $OperationId = ''
+                if ($Inventory.Count) {
+                    $Detail = Get-DMSMigrationDetail -Migration $Inventory[0]
+                    if (-not $Detail) { throw "Cannot inspect the existing migration for '$($Item.Id)'." }
+                    $OperationId = [string]$Detail.MigrationOperationId
+                }
+                $Entry | Add-Member -NotePropertyName RestoreState -NotePropertyValue ([pscustomobject]@{
+                    Database = $Database; MigrationId = $(if ($Inventory.Count) { $Inventory[0].Id } else { '' })
+                    OperationId = $OperationId; ReplaceExisting = $false; Skip = $false
+                }) -Force
+                Write-Host "$($Item.Id): target database exists = $($Database.Exists); existing migration = $([bool]$Inventory.Count)."
+                if ($Database.Exists -or $Inventory.Count) { $Entry }
             }
-            if ($SqlCredentials.ContainsKey($Item.Id) -and $SqlCredentials[$Item.Id] -isnot [pscredential]) {
-                throw "SqlCredentials['$($Item.Id)'] must be a PSCredential."
+            catch {
+                Set-DMSItemFailure -Entry $Entry -Phase 'Target validation' -Message $_.Exception.Message
             }
-            $Database = Get-DMSTargetDatabase -Item $Item -SqlCredential $SqlCredentials[$Item.Id]
-            $Inventory = @(Get-DMSItemInventory -Item $Item)
-            if ($Inventory.Count -gt 1) { throw "Multiple migrations matched '$($Item.Id)'." }
-            $OperationId = ''
-            if ($Inventory.Count) {
-                $Detail = Get-DMSMigrationDetail -Migration $Inventory[0]
-                if (-not $Detail) { throw "Cannot inspect the existing migration for '$($Item.Id)'." }
-                $OperationId = [string]$Detail.MigrationOperationId
-            }
-            $Entry | Add-Member -NotePropertyName RestoreState -NotePropertyValue ([pscustomobject]@{
-                Database = $Database; MigrationId = $(if ($Inventory.Count) { $Inventory[0].Id } else { '' })
-                OperationId = $OperationId; ReplaceExisting = $false; Skip = $false
-            }) -Force
-            Write-Host "$($Item.Id): target database exists = $($Database.Exists); existing migration = $([bool]$Inventory.Count)."
-            if ($Database.Exists -or $Inventory.Count) { $Entry }
         }
     )
     if (-not $Candidates.Count -or $Preview) { return }
@@ -171,7 +179,8 @@ function Initialize-DMSRestorePlan {
         $Entry.RestoreState.ReplaceExisting = $Entry.Item.Id -in $Approved
         $Entry.RestoreState.Skip = -not $Entry.RestoreState.ReplaceExisting
         if ($Entry.RestoreState.ReplaceExisting -and $Entry.RestoreState.Database.Exists -and -not $Entry.RestoreState.Database.CanAlter) {
-            throw "ALTER ANY DATABASE is required for approved replacement '$($Entry.Item.Id)'. Nothing was started."
+            Set-DMSItemFailure -Entry $Entry -Phase 'Replacement approval' `
+                -Message "ALTER ANY DATABASE is required for approved replacement '$($Entry.Item.Id)'. This item will not be restored."
         }
     }
 }

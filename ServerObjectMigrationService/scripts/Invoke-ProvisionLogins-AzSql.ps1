@@ -44,7 +44,7 @@ param(
     [int]$SqlPort = 1433,
 
     [switch]$UseWindowsAuthentication,
-    [Parameter(DontShow)][ValidateSet('Auto', 'Windows', 'Entra', 'SqlLogin')][string]$TargetSqlAuthType = 'Auto',
+    [Parameter(DontShow)][ValidateSet('Auto', 'WindowsAD', 'Entra', 'SqlLogin')][string]$TargetSqlAuthType = 'Auto',
     [Parameter(DontShow)][pscredential]$SqlCredential,
     [bool]$TargetTrustServerCertificate = $false,
     [Parameter(DontShow)][switch]$ServerOnly,
@@ -660,10 +660,11 @@ foreach ($row in $rows) {
         $targetType = $row.TargetType.Trim()
         if ($targetType -notin @('SQLVM', 'SQLMI')) { throw 'Provisioning requires SQLVM or SQLMI.' }
         $AuthType = $TargetSqlAuthType
-        if ($AuthType -eq 'Auto') { $AuthType = if ($targetType -eq 'SQLVM') { 'Windows' } else { 'Entra' } }
+        if ($AuthType -eq 'Auto') { $AuthType = if ($targetType -eq 'SQLVM') { 'WindowsAD' } else { 'Entra' } }
+        if ($AuthType -eq 'WindowsAD' -and $targetType -ne 'SQLVM') { throw 'WindowsAD authentication requires a SQLVM target; use Entra or SqlLogin for SQLMI.' }
         if ($AuthType -eq 'SqlLogin' -and -not $SqlCredential) { throw 'SQL authentication requires a resolved administrative credential.' }
         if ($AuthType -ne 'SqlLogin' -and $SqlCredential) { throw 'SQL credentials cannot be combined with Windows or Entra authentication.' }
-        $UseWindowsAuthentication = $AuthType -eq 'Windows'
+        $UseWindowsAuthentication = $AuthType -eq 'WindowsAD'
         $loginName = $row.LoginName.Trim()
         $loginType = $row.LoginType
         $Domain = if ($row.PSObject.Properties['TargetWindowsDomain']) { [string]$row.TargetWindowsDomain } else { '' }

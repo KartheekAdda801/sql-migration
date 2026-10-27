@@ -43,12 +43,21 @@ function New-DMSItemPlan {
     }
 }
 
+function Set-DMSItemFailure {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Entry, [Parameter(Mandatory)][string]$Phase, [Parameter(Mandatory)][string]$Message)
+
+    $Entry.Result.Status = 'Failed'
+    $Entry.Result.Error = "${Phase}: $Message"
+    Write-Warning "$($Entry.Item.Id): $($Entry.Result.Error). Other selected restore items will continue."
+}
+
 function Initialize-DMSRestoreServices {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][object[]]$Plan)
 
     $Restores = @($Plan | Where-Object {
-        $_.Item.Activity -eq 'Restore' -and
+        $_.Item.Activity -eq 'Restore' -and $_.Result.Status -ne 'Failed' -and
         (-not $_.PSObject.Properties['RestoreState'] -or -not $_.RestoreState.Skip)
     })
     if (-not $Restores.Count) { return }
@@ -225,6 +234,7 @@ function Invoke-DMSRestoreQueue {
 
     $ConfirmPreference = 'None'
     if (-not $ReportPlan) { $ReportPlan = $Plan }
+    $Plan = @($Plan | Where-Object { $_.Result.Status -ne 'Failed' })
     $Active = @{}
     for ($Offset = 0; $Offset -lt $Plan.Count; $Offset += $MaxConcurrentRestores) {
         $End = [math]::Min($Offset + $MaxConcurrentRestores, $Plan.Count) - 1
@@ -358,10 +368,13 @@ function Write-DMSPlanResults {
     $ConfirmPreference = 'None'
     foreach ($Group in @($Plan | Where-Object { $_.Item.OutputJsonPath } | Group-Object { [IO.Path]::GetFullPath($_.Item.OutputJsonPath) })) {
         $Status = 'Succeeded'
-        if ($ErrorMessage -or @($Group.Group | Where-Object { $_.Result.Status -in @('Failed', 'TimedOut', 'SubmissionUnverified', 'MonitoringFailed') }).Count) {
+        if ($ErrorMessage) { $Status = 'Failed' }
+        elseif (@($Group.Group | Where-Object { $_.Result.Status -in @('Pending', 'Submitting', 'Submitted', 'Monitoring') }).Count) {
+            $Status = 'InProgress'
+        }
+        elseif (@($Group.Group | Where-Object { $_.Result.Status -in @('Failed', 'TimedOut', 'SubmissionUnverified', 'MonitoringFailed') }).Count) {
             $Status = 'Failed'
         }
-        elseif (@($Group.Group | Where-Object { $_.Result.Status -in @('Pending', 'Submitting', 'Submitted', 'Monitoring') }).Count) { $Status = 'InProgress' }
         Write-MigrationJsonResult -Path $Group.Name -Result @{
             schemaVersion = 1; operation = 'DMSWorkflow'; updatedAt = [datetime]::UtcNow
             completedAt = $(if ($Status -eq 'InProgress') { $null } else { [datetime]::UtcNow })
@@ -410,12 +423,24 @@ function Invoke-DMSConfiguredActivity {
     foreach ($Entry in $Plan) {
         Write-Host "$($Entry.Item.Id): $($Entry.Item.Activity) $($Entry.Item.TargetType) $($Entry.Item.TargetName)/$($Entry.Item.TrgDatabaseName)"
         if ($Entry.Item.ExportCsvPath) { Assert-ServiceOutputPath -Path $Entry.Item.ExportCsvPath }
-        Invoke-DataMigrationPreflight -Operation $Entry.Operation -Configuration $Entry.Configuration -Options $Entry.Options
+        try {
+            Invoke-DataMigrationPreflight -Operation $Entry.Operation -Configuration $Entry.Configuration -Options $Entry.Options
+        }
+        catch {
+            if ($Entry.Item.Activity -ne 'Restore') { throw }
+            Set-DMSItemFailure -Entry $Entry -Phase 'Preflight' -Message $_.Exception.Message
+        }
     }
     Initialize-DMSRestorePlan -Plan $Plan -SqlCredentials $SqlCredentials -Preview:$WhatIfPreference `
         -NonInteractive:$NonInteractive -CredentialFilePath $CredentialFilePath
     if ($WhatIfPreference) {
-        foreach ($Entry in $Plan) { $null = $PSCmdlet.ShouldProcess($Entry.Migration.Id, $Entry.Item.Activity) }
+        foreach ($Entry in @($Plan | Where-Object { $_.Result.Status -ne 'Failed' })) {
+            $null = $PSCmdlet.ShouldProcess($Entry.Migration.Id, $Entry.Item.Activity)
+        }
+        $Failures = @($Plan | Where-Object { $_.Result.Status -eq 'Failed' })
+        if ($Failures.Count) {
+            throw "Restore preview failed for: $(($Failures | ForEach-Object { "$($_.Item.Id): $($_.Result.Error)" }) -join '; '). No migrations were started."
+        }
         return
     }
     $ReportName = 'Invoke-RestoreDMS.{0}.{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), [guid]::NewGuid().ToString('N')
@@ -426,8 +451,11 @@ function Invoke-DMSConfiguredActivity {
             }
         }
     }
-    $Directory = New-DMSRunDirectory
     Write-DMSPlanResults -Plan $Plan
+    if (-not @($Plan | Where-Object { $_.Result.Status -ne 'Failed' }).Count) {
+        throw "All selected restore items failed validation. $(($Plan | ForEach-Object { "$($_.Item.Id): $($_.Result.Error)" }) -join '; ')"
+    }
+    $Directory = New-DMSRunDirectory
     $RunParameters = @{
         Plan = $Plan; Directory = $Directory; SqlCredentials = $SqlCredentials
         MaxConcurrentRestores = $Configuration.Common.MaxConcurrentRestores
@@ -458,12 +486,24 @@ function Invoke-DMSPreparedPlan {
         foreach ($Entry in @($Plan | Where-Object { $_.Item.Activity -eq 'Remove' })) {
             Remove-DMSItemMigration -Entry $Entry @Confirmation
         }
-        $Restores = @($Plan | Where-Object { $_.Item.Activity -eq 'Restore' })
+        $Restores = @($Plan | Where-Object { $_.Item.Activity -eq 'Restore' -and $_.Result.Status -ne 'Failed' })
         if ($Restores.Count) {
-            Initialize-DMSRestoreServices -Plan $Restores @Confirmation
-            Invoke-DMSRestoreQueue -Plan $Restores `
-                -MaxConcurrentRestores $MaxConcurrentRestores -ReportPlan $Plan `
-                -SqlCredentials $SqlCredentials -ContextPath $ContextPath @Confirmation
+            foreach ($Group in @($Restores | Group-Object {
+                "$($_.Item.SubscriptionId)|$($_.Item.DMSResourceGroup)|$($_.Item.DMSServiceName)"
+            })) {
+                try { Initialize-DMSRestoreServices -Plan $Group.Group @Confirmation }
+                catch {
+                    foreach ($Entry in $Group.Group) {
+                        Set-DMSItemFailure -Entry $Entry -Phase 'DMS service initialization' -Message $_.Exception.Message
+                    }
+                }
+            }
+            $Ready = @($Restores | Where-Object { $_.Result.Status -ne 'Failed' })
+            if ($Ready.Count) {
+                Invoke-DMSRestoreQueue -Plan $Ready `
+                    -MaxConcurrentRestores $MaxConcurrentRestores -ReportPlan $Plan `
+                    -SqlCredentials $SqlCredentials -ContextPath $ContextPath @Confirmation
+            }
         }
         $Monitor = @($Plan | Where-Object { $_.Item.Activity -eq 'Monitor' })
         if ($Monitor.Count) {
@@ -492,7 +532,10 @@ function Invoke-DMSPreparedPlan {
             } while ($Pending.Count)
         }
         $Plan.Result | Format-Table ItemId, Activity, TargetName, DatabaseName, Status, Error -AutoSize | Out-Host
-        if (@($Plan | Where-Object { $_.Result.Status -in @('Failed', 'TimedOut', 'SubmissionUnverified', 'MonitoringFailed') }).Count) { throw 'One or more DMS activities failed. Review the results.' }
+        $Failures = @($Plan | Where-Object { $_.Result.Status -in @('Failed', 'TimedOut', 'SubmissionUnverified', 'MonitoringFailed') })
+        if ($Failures.Count) {
+            throw "One or more DMS activities failed. Review the results. $(($Failures | ForEach-Object { "$($_.Item.Id): $($_.Result.Error)" }) -join '; ')"
+        }
     }
     catch {
         $RunError = $_.Exception.Message
