@@ -223,6 +223,30 @@ function Select-DMSCutoverMigration {
     }
 }
 
+function Get-DMSConfiguredSqlService {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Item)
+
+    # Listing distinguishes an absent service from failed resource-group access without suppressing errors.
+    $Services = @(Get-AzDataMigrationSqlService -ResourceGroupName $Item.DMSResourceGroup `
+        -SubscriptionId $Item.SubscriptionId -ErrorAction Stop |
+        Where-Object { $_.Name -ieq $Item.DMSServiceName })
+    if ($Services.Count -gt 1) { throw "Multiple DMS SQL services matched '$($Item.DMSServiceName)'." }
+    if ($Services.Count) { return $Services[0] }
+}
+
+function Assert-DMSConfiguredSqlService {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Item, [Parameter(Mandatory)][object]$Service)
+
+    if ($Service.Location -and $Service.Location -ine $Item.Location) {
+        throw "Configured Location does not match DMS '$($Item.DMSServiceName)'."
+    }
+    if ($Service.ProvisioningState -and $Service.ProvisioningState -ne 'Succeeded') {
+        throw "DMS '$($Item.DMSServiceName)' is not successfully provisioned."
+    }
+}
+
 function Get-DMSMigrationInventory {
     [CmdletBinding()]
     param(
@@ -381,6 +405,17 @@ function Invoke-DMSRollingCutover {
 function Get-ContainerName {
     param([string]$ServerName, [string]$DatabaseName)
 
+    # Accept a host or host\instance, not a SQL connection string or an empty component.
+    $ServerParts = @($ServerName -split '\\')
+    if ([string]::IsNullOrWhiteSpace($ServerName) -or $ServerParts.Count -gt 2 -or
+        $ServerName -match '[\s/,:<>\x00-\x1f]' -or
+        @($ServerParts | Where-Object { $_ -notmatch '[\p{L}\p{N}]' }).Count) {
+        throw 'SrcServerName must contain a source server name, optionally followed by \instance with a nonempty instance name.'
+    }
+    if ([string]::IsNullOrWhiteSpace($DatabaseName) -or $DatabaseName -match '[<>\x00-\x1f]') {
+        throw 'SrcDatabaseName must contain a nonempty source database name, not a placeholder or control characters.'
+    }
+
     $containerName = ("{0}_{1}" -f $ServerName, $DatabaseName).ToLowerInvariant()
     $containerName = $containerName -replace '[^a-z0-9-]', '-'
     $containerName = $containerName -replace '-+', '-'
@@ -393,6 +428,10 @@ function Get-ContainerName {
 
     if ($containerName.Length -gt 63) {
         $containerName = $containerName.Substring(0, 63).TrimEnd('-')
+    }
+
+    if ($containerName -notmatch '^[a-z0-9](?:[a-z0-9-]{1,61})[a-z0-9]$') {
+        throw 'SrcServerName/SrcDatabaseName do not produce a valid Azure Blob container name after normalization.'
     }
 
     return $containerName

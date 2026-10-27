@@ -316,10 +316,11 @@ directory access/identities or explicit mappings, and rerun Generate/replay.
 
 The old `ManagedIdentityName`, `ManagedIdentityRoles`, and
 `ManagedIdentityPermissions` properties and their generated SQL component have
-been removed. Configure managed identities only under item `Logins`, using
+been removed. On SQLMI, configure managed identities only under item `Logins`, using
 `Type: "ManagedIdentity"` and per-principal `AccessType` and optional `Databases`.
 Set that item's `ProvisionLogins: true` to apply them directly without storage.
-Target external-authentication and directory lookup permissions remain prerequisites.
+SQLVM does not support these external principal types for provisioning.
+Target external-authentication and directory lookup permissions remain prerequisites on SQLMI.
 
 Mail snapshots preserve source sender/display/reply-to values and SMTP server/port.
 Execute overrides only the SMTP server and port through parsed procedure parameters.
@@ -632,17 +633,58 @@ rules. Older snapshots are rejected; they are not rewritten during replay.
 
 Use [Invoke-ProvisionLogins-AzSql.ps1](./scripts/Invoke-ProvisionLogins-AzSql.ps1)
 for new logins, rather than source-object migration. It uses the selected item's
-target type, host, and port. The checked-in items include SQL logins `dbmigration`
-and `dbtestuser`, using secrets `sql-dbmigration-pwd` and `sql-dbtestuser-pwd`
-in the inherited `ak-personal-kv`, plus the configured external principals.
-Verify each external `Name` and `Type`, and confirm both secrets exist before
-enabling provisioning. VM/MI identities use `Type: "ManagedIdentity"`, not `EntraUser`.
+target type, host, and port. Confirm each configured secret and principal before
+enabling provisioning.
+
+| Target | Allowed login principal types |
+|--------|-------------------------------|
+| SQLVM | `SqlLogin`, `WindowsAD` (domain-qualified Windows AD user) |
+| SQLMI | `SqlLogin`, `EntraUser`, `EntraGroup`, `ManagedIdentity` |
+
+These are login principal types, not connection authentication settings.
+`TargetSqlAuthType` still selects the administrator's connection authentication.
+Entra connection authentication does not enable provisioning Entra principals on SQLVM.
+
+For SQLVM SQL logins, enable **SQL Server and Windows Authentication mode**
+(mixed mode) alongside domain authentication. Restart SQL Server after changing
+authentication mode as required for the change to take effect. This tool does
+not change the server authentication mode.
+
+For SQLMI SQL logins, obtain approved exceptions where Entra-only authentication
+or organizational policies apply. Do not automatically disable Entra-only
+authentication or organizational controls to make provisioning succeed.
+
+For `WindowsAD`, set `TargetWindowsDomain` on the item to the independently
+verified expected NetBIOS domain for the target SQL Server. For example, use
+`TargetWindowsDomain: "CONTOSO"` with `Name: "CONTOSO\appuser"` (JSON:
+`"CONTOSO\\appuser"`). These are placeholders, not operational accounts.
+Use `DOMAIN\user`
+in `Name`, without `SecretName`, `ForcePasswordReset`, or `ObjectId`. UPNs,
+unqualified names, local accounts, other domains and Windows groups are not
+supported. Do not infer this setting from `SourceDomainSuffix`, a hostname,
+or the requested login name. You must verify the correct target domain before
+configuring a Windows AD account. The operational SQLVM configuration contains
+only `SqlLogin` and does not need `TargetWindowsDomain`.
+
+Preflight compares SQL Server's `DEFAULT_DOMAIN()` with `TargetWindowsDomain`
+and the account prefix, case-insensitively. A missing, blank or mismatching
+reported default Windows domain stops provisioning, even if a trusted
+other-domain account could resolve. The worker repeats this comparison before
+login writes and inside the login-creation transaction.
+Preflight also resolves the account/SID on the target using `xp_logininfo` and
+`SUSER_SID`; resolution/permission failures stop provisioning. Since
+`xp_logininfo` can return no rows for an account without SQL access, the worker
+also verifies Windows user type and SID inside the login-creation transaction.
+Groups and conflicting principals fail and roll back before database grants.
+These checks compare the target SQL Server's default Windows domain; they do
+not independently verify the machine's domain membership.
 
 Set `ProvisionLogins: true` on only the intended items. Each login has independent
-access; this illustrative item fragment adds a group and managed identity:
+access; this illustrative SQLMI item fragment adds a group and managed identity:
 
 ```json
 {
+  "TargetType": "SQLMI",
   "KeyVaultName": "ak-personal-kv",
   "ProvisionLogins": true,
   "Logins": [
@@ -681,7 +723,11 @@ access; this illustrative item fragment adds a group and managed identity:
 ```
 
 Replace illustrative group/identity names with existing directory principals
-before using them. External identities use no password or Key Vault secret.
+before using them. Both system-assigned and user-assigned managed identities use
+`Type: "ManagedIdentity"` with the identity's service-principal name and optional
+directory `ObjectId` (principal ID), not its application/client ID. There is no
+separate managed-identity subtype field. These identities are supported only on
+SQLMI. External identities use no password or Key Vault secret.
 Optional `ObjectId` is the directory object GUID, not an application/client ID.
 The name must still resolve through SQL's external provider; duplicate display
 names can fail even with `ObjectId`, which is used for identity verification.

@@ -448,14 +448,26 @@ Items record, update:
   "SrcDatabaseName": "MIGRDEMO",
   "BackupRootPath": "C:\\Backups\\DESKTOP-SGA61QP$DMF\\MIGRDEMO",
   "IsActive": "Y",
-  "BackupStorageAccountName": "akpersonalsa",
-  "BackupContainerName": "desktop-sga61qp-dmf-migrdemo"
+  "BackupStorageAccountName": "akpersonalsa"
 }
 ```
 
 The current row is active and `Settings.Overwrite` is `"true"`; review overwrite
 behavior before a live upload. Use `IsActive="N"` to exclude a row from upload.
-Prepare compatible timestamped backups and the destination container separately.
+Prepare compatible timestamped backups and the storage account separately.
+Live copy creates the source-derived container before uploading. Copy and both
+restore platforms use the same shared naming helper: `servername-databasename`,
+or `servername-instancename-databasename` for a named instance. Names use
+invariant lowercase, sanitized/collapsed hyphens, and the existing 63-character
+limit. Use identical `SrcServerName` and `SrcDatabaseName` for copy and restore,
+even when `TrgDatabaseName` renames the target. JSON escapes `\` as `\\`.
+Preflight and WhatIf remain read-only. Authenticate Azure PowerShell and AzCopy;
+the executor needs storage list, container creation, and upload permissions.
+Restore requires an existing populated container. Remove obsolete
+`BackupContainerName` and `BackupStorageContainerName` config fields; overrides
+are rejected, and existing differently named containers are not renamed.
+See [source-derived containers](DataMigrationService/README.md#source-derived-backup-containers)
+for normalization and upgrade guidance.
 
 ```powershell
 & '.\DataMigrationService\scripts\Invoke-CopyBackup-OnPrem-AzureBlob.ps1' -WhatIf
@@ -490,7 +502,6 @@ VM-MIGRDEMO is one source-to-target item:
   "SrcDatabaseName": "MIGRDEMO",
   "BackupStorageAccount": "",
   "BackupStorageResourceGroup": "",
-  "BackupStorageContainerName": "desktop-sga61qp-dmf-migrdemo",
   "TargetType": "SQLVM",
   "TargetName": "akpersonalsqlvm",
   "TargetResourceGroup": "",
@@ -549,7 +560,6 @@ keep the MI-MIGRDEMO mapping alongside the VM mapping:
   "Activity": "",
   "SrcServerName": "DESKTOP-SGA61QP\\DMF",
   "SrcDatabaseName": "MIGRDEMO",
-  "BackupStorageContainerName": "desktop-sga61qp-dmf-migrdemo",
   "TargetType": "SQLMI",
   "TargetName": "ak-personal-sqlmi",
   "TargetResourceGroup": "",

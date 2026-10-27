@@ -17,9 +17,12 @@
 
     Multi-server / multi-database support:
       - JSON Items can contain multiple records, each describing one (SrcServerName, SrcDatabaseName) backup set.
-      - If BackupContainerName is not supplied in a row, the script derives it from
-        "<SrcServerName>_<SrcDatabaseName>" and then sanitizes to a valid Azure container
-        name (lowercase, only letters/numbers/hyphens).
+      - Uses the same Get-ContainerName helper as SQLVM and SQLMI restore:
+        servername-databasename or servername-instancename-databasename.
+        Names are lowercase, sanitized, and limited to 63 characters.
+      - Live copy creates a missing container before uploading. Preflight and WhatIf
+        only read storage. Authenticate both Azure PowerShell and AzCopy; the executor
+        needs container creation and Blob upload permissions.
       - This allows the same SrcDatabaseName to appear on multiple servers while each
         server+database pair maps to its own container.
 
@@ -38,9 +41,9 @@
       - IsActive           : 'Y' to process backups for this row; 'N' to skip uploads.
       - BackupStorageAccountName : Azure Storage account name.
 
-    Optional columns per row:
-      - BackupContainerName : If provided, use as-is. If blank, derive as
-                             sanitized "<SrcServerName>_<SrcDatabaseName>".
+    Container overrides are not supported. Use the same source mapping for copy and
+    restore, even when the target database is renamed. Existing differently named
+    containers are not renamed automatically.
 
 .PARAMETER Overwrite
     Controls AzCopy overwrite behavior: 'prompt', 'true' (default), or 'false'.
@@ -213,6 +216,7 @@ if ($missingColumns.Count -gt 0) {
 
 Write-Log ("Loaded {0} metadata row(s)." -f $metadata.Count) 'INFO'
 foreach ($row in $metadata) {
+    Assert-DMSContainerConfiguration -Value $row
     if ($row.IsActive -notmatch '^[YN]$') {
         throw "IsActive must be Y or N for '$($row.SrcServerName)/$($row.SrcDatabaseName)'."
     }
@@ -567,7 +571,6 @@ if ($CheckLatestBak -ne 'Y') {
         $storageAccount    = $row.BackupStorageAccountName
         $serverName        = $row.SrcServerName
         $databaseName      = $row.SrcDatabaseName
-        $rowContainerName  = $row.PSObject.Properties["BackupContainerName"].Value
 
         $activeValue = $row.IsActive.ToString().Trim().ToUpperInvariant()
         if ($activeValue -eq 'N') {
@@ -591,22 +594,8 @@ if ($CheckLatestBak -ne 'Y') {
                 throw "SrcDatabaseName is empty for this row."
             }
 
-            # Derive container name if not explicitly provided
-            $resolvedContainerName = $rowContainerName
-            if (-not $resolvedContainerName -or $resolvedContainerName.Trim().Length -eq 0) {
-                $rawContainerName = "{0}_{1}" -f $serverName, $databaseName
-                $resolvedContainerName = $rawContainerName.ToLower()
-                $resolvedContainerName = $resolvedContainerName -replace "[^a-z0-9-]", "-"
-                $resolvedContainerName = $resolvedContainerName -replace "-+", "-"
-                $resolvedContainerName = $resolvedContainerName.Trim('-')
-                if ($resolvedContainerName.Length -lt 3) {
-                    $resolvedContainerName = "db-$resolvedContainerName"
-                }
-                if ($resolvedContainerName.Length -gt 63) {
-                    $resolvedContainerName = $resolvedContainerName.Substring(0,63).TrimEnd('-')
-                }
-                Write-Log ("Derived container '{0}' from SrcServerName='{1}', SrcDatabaseName='{2}' (raw pattern: '{3}')" -f $resolvedContainerName, $serverName, $databaseName, $rawContainerName) 'INFO'
-            }
+            $resolvedContainerName = Get-ContainerName -ServerName $serverName -DatabaseName $databaseName
+            Write-Log ("Derived container '{0}' from SrcServerName='{1}', SrcDatabaseName='{2}'" -f $resolvedContainerName, $serverName, $databaseName) 'INFO'
 
             if ($resolvedContainerName -notmatch '^(?=.{3,63}$)[a-z0-9]+(?:-[a-z0-9]+)*$') {
                 throw "Invalid Azure Blob container name: '$resolvedContainerName'."

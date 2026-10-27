@@ -155,24 +155,30 @@ function Invoke-ServerObjectPreflight {
     if ($Options.ContainsKey('OutputJsonPath') -and $Options.OutputJsonPath) { Assert-ServiceOutputPath -Path $Options.OutputJsonPath }
     $Items = @($Configuration.Items)
     if ($Operation -eq 'Invoke-ProvisionLogins-AzSql') {
-        Assert-ServiceOutputPath -Path (Join-Path $Options.OutputRoot '.preflight')
         Assert-ServiceFields -Items $Items -Required Application, TargetServerName, TargetServerFQDN, TargetType, TenantId, SubscriptionId, LoginName, LoginType, Database
         foreach ($Item in $Items) {
             Assert-ServiceGuid -Name TenantId -Value $Item.TenantId
             Assert-ServiceGuid -Name SubscriptionId -Value $Item.SubscriptionId
-            if ($Item.TargetType -notin @('SQLVM', 'SQLMI')) { throw 'Login provisioning requires SQLVM or SQLMI.' }
-            if ($Item.LoginType -notin @('SqlLogin', 'EntraUser', 'EntraGroup', 'ManagedIdentity') -or
-                $Item.ForcePasswordReset -isnot [bool] -or $Item.AccessType -isnot [array] -or
+            $Domain = if ($Item.PSObject.Properties['TargetWindowsDomain']) { [string]$Item.TargetWindowsDomain } else { '' }
+            Assert-ServerObjectLoginTarget -TargetType $Item.TargetType -LoginType $Item.LoginType -LoginName $Item.LoginName -TargetWindowsDomain $Domain
+            if ($Item.ForcePasswordReset -isnot [bool] -or $Item.AccessType -isnot [array] -or
                 @($Item.AccessType | Where-Object { $_ -isnot [string] -or $_ -notmatch '^[A-Za-z_ ]+$' -or [string]::IsNullOrWhiteSpace($_) }).Count) {
                 throw "Invalid login type, reset setting, or access list for '$($Item.LoginName)'."
             }
             if ($Item.LoginType -eq 'SqlLogin') {
                 Assert-ServiceFields -Items @($Item) -Required KeyVaultName, SecretName
             }
+            elseif ($Item.LoginType -eq 'WindowsAD') {
+                if (($Item.PSObject.Properties['ObjectId'] -and $Item.ObjectId) -or
+                    ($Item.PSObject.Properties['SecretName'] -and $Item.SecretName) -or $Item.ForcePasswordReset) {
+                    throw 'WindowsAD cannot specify ObjectId, SecretName or ForcePasswordReset.'
+                }
+            }
         }
+        Assert-ServiceOutputPath -Path (Join-Path $Options.OutputRoot '.preflight')
         Import-Module SqlServer, Az.Accounts -ErrorAction Stop
         if (@($Items | Where-Object LoginType -eq 'SqlLogin').Count) { Import-Module Az.KeyVault -ErrorAction Stop }
-        if (@($Items | Where-Object LoginType -ne 'SqlLogin').Count) { Import-Module Az.Resources -ErrorAction Stop }
+        if (@($Items | Where-Object LoginType -in @('EntraUser', 'EntraGroup', 'ManagedIdentity')).Count) { Import-Module Az.Resources -ErrorAction Stop }
         foreach ($Item in $Items) {
             $Context = Get-AzContext -ErrorAction Stop
             if (-not $Context -or $Context.Tenant.Id -ne $Item.TenantId) { throw "Authenticate for tenant '$($Item.TenantId)' before preflight." }
@@ -186,7 +192,7 @@ function Invoke-ServerObjectPreflight {
                 }
                 $Secret = $null
             }
-            else {
+            elseif ($Item.LoginType -ne 'WindowsAD') {
                 $Item.ObjectId = Resolve-ServerObjectExternalPrincipal -Login $Item
             }
             $HostName = [string]$Item.TargetServerFQDN
@@ -194,6 +200,10 @@ function Invoke-ServerObjectPreflight {
             $Type = if ($Options.ContainsKey('TargetSqlAuthType')) { $Options.TargetSqlAuthType } else { 'Auto' }
             $Credential = if ($Options.ContainsKey('SqlCredential')) { $Options.SqlCredential } else { $null }
             $Auth = Get-ServerObjectTargetAuth -Item $Item -TargetSqlAuthType $Type -TrustServerCertificate $TargetTrust -SqlCredential $Credential
+            if ($Item.LoginType -eq 'WindowsAD') {
+                $Query = Get-ServerObjectWindowsLoginValidationSql -LoginName $Item.LoginName -TargetWindowsDomain $Item.TargetWindowsDomain
+                $null = Invoke-ServerObjectPreflightQuery -Server "$HostName,$($Options.SqlPort)" -Database master @Auth -Query $Query
+            }
             if ($Options.ContainsKey('ServerOnly') -and $Options.ServerOnly) {
                 Assert-ServerObjectSqlAccess -Server "$HostName,$($Options.SqlPort)" -Database master @Auth -ServerPermissions @('ALTER ANY LOGIN')
                 continue

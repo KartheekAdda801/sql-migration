@@ -43,6 +43,45 @@ function New-DMSItemPlan {
     }
 }
 
+function Initialize-DMSRestoreServices {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][object[]]$Plan)
+
+    $Restores = @($Plan | Where-Object {
+        $_.Item.Activity -eq 'Restore' -and
+        (-not $_.PSObject.Properties['RestoreState'] -or -not $_.RestoreState.Skip)
+    })
+    if (-not $Restores.Count) { return }
+    Assert-ServiceFields -Items @($Restores | ForEach-Object { $_.Item }) -Required SubscriptionId, DMSResourceGroup, DMSServiceName, Location
+    $Groups = @($Restores | Group-Object {
+        "$($_.Item.SubscriptionId)|$($_.Item.DMSResourceGroup)|$($_.Item.DMSServiceName)"
+    })
+    foreach ($Group in $Groups) {
+        $Locations = @($Group.Group | ForEach-Object { $_.Item.Location } | Sort-Object -Unique)
+        if ($Locations.Count -ne 1) { throw "Conflicting Location values for DMS '$($Group.Group[0].Item.DMSServiceName)'." }
+    }
+    foreach ($Group in $Groups) {
+        $Item = $Group.Group[0].Item
+        $Service = Get-DMSConfiguredSqlService -Item $Item
+        if ($Service) {
+            Assert-DMSConfiguredSqlService -Item $Item -Service $Service
+            Write-Host "Reusing DMS SQL service '$($Item.DMSServiceName)' in '$($Item.DMSResourceGroup)'."
+            continue
+        }
+        $ResourceId = "/subscriptions/$($Item.SubscriptionId)/resourceGroups/$($Item.DMSResourceGroup)/providers/Microsoft.DataMigration/sqlMigrationServices/$($Item.DMSServiceName)"
+        if ($PSCmdlet.ShouldProcess($ResourceId, "Create DMS SQL service in '$($Item.Location)'")) {
+            $null = New-AzDataMigrationSqlService -Name $Item.DMSServiceName -ResourceGroupName $Item.DMSResourceGroup `
+                -SubscriptionId $Item.SubscriptionId -Location $Item.Location -WhatIf:$false -Confirm:$false -ErrorAction Stop
+            $Service = Get-DMSConfiguredSqlService -Item $Item
+            if (-not $Service -or -not $Service.Id) {
+                throw "Created DMS SQL service '$($Item.DMSServiceName)' could not be verified. No restores were submitted."
+            }
+            Assert-DMSConfiguredSqlService -Item $Item -Service $Service
+            Write-Host "Created DMS SQL service '$($Item.DMSServiceName)' in '$($Item.DMSResourceGroup)'."
+        }
+    }
+}
+
 function Get-DMSRestoreBackup {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Item, [Parameter(Mandatory)][string]$Container)
@@ -102,8 +141,7 @@ function Start-DMSItemRestore {
         Write-Warning "Skipping '$($Item.Id)': a migration already exists with status '$($Existing[0].MigrationStatus)'. Use Status or Monitor to inspect it; no replacement was submitted."
         return [pscustomobject]@{ Status = 'SkippedExistingMigration' }
     }
-    $Container = $Item.BackupStorageContainerName
-    if (-not $Container) { $Container = Get-ContainerName -ServerName $Item.SrcServerName -DatabaseName $Item.SrcDatabaseName }
+    $Container = Get-ContainerName -ServerName $Item.SrcServerName -DatabaseName $Item.SrcDatabaseName
     $Backup = Get-DMSRestoreBackup -Item $Item -Container $Container
     $Service = Get-AzDataMigrationSqlService -Name $Item.DMSServiceName -ResourceGroupName $Item.DMSResourceGroup -ErrorAction Stop
     if (-not $Service.Id) { throw "DMS service '$($Item.DMSServiceName)' did not return an ID." }
@@ -422,6 +460,7 @@ function Invoke-DMSPreparedPlan {
         }
         $Restores = @($Plan | Where-Object { $_.Item.Activity -eq 'Restore' })
         if ($Restores.Count) {
+            Initialize-DMSRestoreServices -Plan $Restores @Confirmation
             Invoke-DMSRestoreQueue -Plan $Restores `
                 -MaxConcurrentRestores $MaxConcurrentRestores -ReportPlan $Plan `
                 -SqlCredentials $SqlCredentials -ContextPath $ContextPath @Confirmation

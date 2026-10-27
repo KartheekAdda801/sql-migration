@@ -29,11 +29,20 @@ BeforeAll {
     function Set-AzContext { [CmdletBinding(SupportsShouldProcess)]param($SubscriptionId, $Scope) throw 'Unmocked Azure call' }
     function Get-AzResource { [CmdletBinding()]param($ResourceId, [switch]$ExpandProperties) throw 'Unmocked Azure call' }
     function Get-AzStorageAccountKey { [CmdletBinding()]param($ResourceGroupName, $Name) throw 'Unmocked Azure call' }
-    function Get-AzDataMigrationSqlService { [CmdletBinding()]param($Name, $ResourceGroupName) throw 'Unmocked Azure call' }
+    function New-AzStorageContext { [CmdletBinding()]param($StorageAccountName, [switch]$UseConnectedAccount) throw 'Unmocked Azure call' }
+    function Get-AzStorageContainer { [CmdletBinding()]param($Context) throw 'Unmocked Azure call' }
+    function Get-AzStorageBlob { [CmdletBinding()]param($Container, $Context) throw 'Unmocked Azure call' }
+    function Invoke-TestAzCopy { throw 'Unmocked AzCopy' }
+    function Get-AzDataMigrationSqlService { [CmdletBinding()]param($Name, $ResourceGroupName, $SubscriptionId) throw 'Unmocked Azure call' }
+    function New-AzDataMigrationSqlService {
+        [CmdletBinding(SupportsShouldProcess)]param($Name, $ResourceGroupName, $SubscriptionId, $Location)
+        throw 'Unexpected DMS service creation'
+    }
     function New-AzDataMigrationToSqlManagedInstance {
         [CmdletBinding()]param($AzureBlobAuthType, $AzureBlobIdentityType, $AzureBlobUserAssignedIdentity, $AzureBlobAccountKey)
         throw 'Unexpected mutation'
     }
+
     function Write-TestConfiguration {
         param([string]$Path, [object[]]$Items = @(), [hashtable]$Settings = @{})
         @{ schemaVersion = 1; Settings = $Settings; Items = @($Items) } |
@@ -45,6 +54,83 @@ BeforeAll {
         if (Test-Path -LiteralPath $Original) { return $Original }
         throw "Missing config for '$($Entry.Name)'."
     }
+}
+
+Describe 'Copy-specific missing-container preflight' -Tag 'Unit' {
+        BeforeEach {
+            Mock Import-Module {}
+            Mock Get-AzContext { [pscustomobject]@{ Subscription = 'authenticated' } }
+            Mock Assert-ServiceTcpEndpoint {}
+            Mock New-AzStorageContext { 'connected-context' }
+            Mock Get-AzStorageContainer { @() }
+            Mock Get-AzStorageBlob { [pscustomobject]@{ Name = 'AppDb_20261019_010000.bak' } }
+            Mock Get-Command { [pscustomobject]@{ Source = 'Invoke-TestAzCopy' } } -ParameterFilter { $Name -eq 'azcopy' }
+            Mock Invoke-TestAzCopy { $global:LASTEXITCODE = 0 }
+            Mock Write-Host {}
+            Mock Write-Warning {}
+            $Folder = Join-Path $TestDrive 'copy\full'
+            $null = New-Item -ItemType Directory -Path $Folder -Force
+            Set-Content -LiteralPath (Join-Path $Folder 'AppDb_20261019_010000.bak') -Value 'backup'
+            $Copy = [pscustomobject]@{ schemaVersion = 1; Settings = [pscustomobject]@{}; Items = @(
+                [pscustomobject]@{
+                    SrcServerName = 'SoUrCe\InStAnCe'; SrcDatabaseName = 'AppDb'
+                    BackupRootPath = (Split-Path $Folder); IsActive = 'Y'; BackupStorageAccountName = 'demostorage'
+                }
+            ) }
+            $Options = @{ CheckLatestBak = 'N' }
+        }
+        It 'Allows a missing copy container with read-only account-level AzCopy authentication' {
+            Invoke-DataMigrationPreflight -Operation 'Invoke-CopyBackup-OnPrem-AzureBlob' -Configuration $Copy -Options $Options
+            Should -Invoke Get-AzStorageContainer -Times 1 -Exactly
+            Should -Invoke Get-AzStorageBlob -Times 0 -Exactly
+            Should -Invoke Invoke-TestAzCopy -Times 1 -Exactly -ParameterFilter {
+                $args[0] -eq 'list' -and $args[1] -eq 'https://demostorage.blob.core.windows.net'
+            }
+        }
+        It 'Keeps existing-container Blob reads and container-level AzCopy checks' {
+            Mock Get-AzStorageContainer { [pscustomobject]@{ Name = 'source-instance-appdb' } }
+            Invoke-DataMigrationPreflight -Operation 'Invoke-CopyBackup-OnPrem-AzureBlob' -Configuration $Copy -Options $Options
+            Should -Invoke Get-AzStorageBlob -Times 1 -Exactly -ParameterFilter { $Container -eq 'source-instance-appdb' }
+            Should -Invoke Invoke-TestAzCopy -Times 1 -Exactly -ParameterFilter {
+                $args[0] -eq 'list' -and $args[1] -eq 'https://demostorage.blob.core.windows.net/source-instance-appdb'
+            }
+        }
+        It 'Does not mask account listing permission or network failures' -ForEach @(
+            @{ Message = 'AuthorizationPermissionMismatch' }, @{ Message = 'Network unavailable' }
+        ) {
+            Mock Get-AzStorageContainer { throw $Message }
+            { Invoke-DataMigrationPreflight -Operation 'Invoke-CopyBackup-OnPrem-AzureBlob' -Configuration $Copy -Options $Options } |
+                Should -Throw "*$Message*"
+            Should -Invoke Invoke-TestAzCopy -Times 0 -Exactly
+        }
+        It 'Rejects failed AzCopy authentication even when Azure PowerShell can list the account' {
+            Mock Invoke-TestAzCopy { $global:LASTEXITCODE = 1; 'Authentication failed' }
+            { Invoke-DataMigrationPreflight -Operation 'Invoke-CopyBackup-OnPrem-AzureBlob' -Configuration $Copy -Options $Options } |
+                Should -Throw '*AzCopy cannot list*Authenticate AzCopy*'
+        }
+        It 'Does not mask existing-container Blob read failures' {
+            Mock Get-AzStorageContainer { [pscustomobject]@{ Name = 'source-instance-appdb' } }
+            Mock Get-AzStorageBlob { throw 'Blob read denied' }
+            { Invoke-DataMigrationPreflight -Operation 'Invoke-CopyBackup-OnPrem-AzureBlob' -Configuration $Copy -Options $Options } |
+                Should -Throw '*Blob read denied*'
+        }
+        It 'Keeps the actual copy gateway read-only under WhatIf with a missing destination' {
+            $Path = Join-Path $TestDrive 'copy.json'
+            Write-TestConfiguration -Path $Path -Items $Copy.Items
+            $Gateway = Get-EntryGateway -File $Entries[0]
+            $script:ExecutionStarted = $false
+            Mock New-Item { throw 'WhatIf must not create local or remote state' }
+            & $Gateway -ConfigPath $Path -WhatIf
+            $script:ExecutionStarted | Should -BeFalse
+            Should -Invoke Invoke-TestAzCopy -Times 1 -Exactly -ParameterFilter { $args[0] -eq 'list' }
+            Should -Invoke Invoke-TestAzCopy -Times 0 -Exactly -ParameterFilter { $args[0] -in @('make', 'copy') }
+            Should -Invoke New-Item -Times 0 -Exactly
+        }
+        It 'Requires an existing container for restore storage reads' {
+            { Assert-ServiceStorage -Account demostorage -Container source-instance-appdb } |
+                Should -Throw '*does not exist*'
+            Should -Invoke Get-AzStorageBlob -Times 0 -Exactly
+        }
 }
 
 Describe 'Schema-one upload entry configuration contract' -Tag 'Unit' {
@@ -98,6 +184,16 @@ Describe 'Schema-one upload entry configuration contract' -Tag 'Unit' {
             { Read-ServiceConfiguration -Path $Path } | Should -Throw
         }
     }
+    It 'Rejects obsolete schema-one container overrides before preflight' -ForEach @(
+        @{ Field = 'BackupContainerName'; Value = '' }
+        @{ Field = 'BackupStorageContainerName'; Value = 'old-container' }
+    ) {
+        $Path = Join-Path $TestDrive 'obsolete.json'
+        $Row = [pscustomobject]@{ SrcServerName = 'source'; SrcDatabaseName = 'db' }
+        $Row | Add-Member -NotePropertyName $Field -NotePropertyValue $Value
+        Write-TestConfiguration -Path $Path -Items @($Row)
+        { Read-ServiceConfiguration -Path $Path } | Should -Throw "*$Field*Remove it*SrcServerName/SrcDatabaseName*"
+    }
 }
 
 Describe 'Schema-one upload entry gateway safety' -Tag 'Unit' {
@@ -119,7 +215,7 @@ Describe 'Schema-one upload entry gateway safety' -Tag 'Unit' {
         Should -Invoke Invoke-ServerObjectPreflight -Times 0 -Exactly
         Should -Invoke Invoke-DataMigrationPreflight -Times 1 -Exactly -ParameterFilter {
             $Operation -eq 'Invoke-CopyBackup-OnPrem-AzureBlob' -and $Options.AzCopyPath -like '*azcopy.exe' -and
-            $Options.SubscriptionId -eq 'cd7743ef-8ddc-4254-b715-2c79c8ab4126'
+            $Options.SubscriptionId -eq (Read-ServiceConfiguration -Path $Path).Settings.SubscriptionId
         }
     }
     It 'Aborts every entry before its work body when preflight fails' {
@@ -151,12 +247,16 @@ Describe 'Read-only data-migration preflight' -Tag 'Unit' {
         Mock Import-Module {}
         Mock Get-AzContext { [pscustomobject]@{ Subscription = 'authenticated' } }
         Mock Set-AzContext {}
-        Mock Assert-ServiceStorage { [pscustomobject]@{ Name = 'db_20261019_010000.bak' } }
+        Mock Assert-ServiceStorage {
+            if ($AllowMissingContainer) { return [pscustomobject]@{ ContainerExists = $true } }
+            [pscustomobject]@{ Name = 'db_20261019_010000.bak' }
+        }
         Mock Assert-ServiceTcpEndpoint {}
         Mock Get-AzResource {
             [pscustomobject]@{ Properties = @{ fullyQualifiedDomainName = 'target.example' }; Identity = @{ PrincipalId = 'identity' } }
         }
-        Mock Get-AzDataMigrationSqlService { [pscustomobject]@{ ProvisioningState = 'Succeeded' } }
+        Mock Get-AzDataMigrationSqlService { [pscustomobject]@{ Name = 'test-dms'; ProvisioningState = 'Succeeded' } }
+        Mock New-AzDataMigrationSqlService {}
         Mock Get-AzStorageAccountKey { @([pscustomobject]@{ Value = 'test-key' }) }
         Mock Write-Host {}
         Mock Write-Warning {}
@@ -165,14 +265,13 @@ Describe 'Read-only data-migration preflight' -Tag 'Unit' {
             CheckLatestBak = 'N'; BlobAuthType = 'AccountKey'; BlobIdentityType = 'SystemAssigned'
             BlobUserAssignedIdentity = ''; TargetSqlPort = 1433
         }
-        $Shared = Read-ServiceConfiguration -Path (Join-Path $DataScripts '..\config\Invoke-RestoreDMS.config.json')
+        $Shared = Read-ServiceConfiguration -Path (Join-Path $PSScriptRoot 'Fixtures\Restore.config.json')
         $Shared.Common.Activity = 'Restore'
         $Shared.Items = @($Shared.Items | Where-Object TargetType -eq 'SQLMI')
         $Restore = ConvertTo-DMSItemConfiguration -Item @(Resolve-DMSConfigurationItems -Configuration $Shared)[0]
         $Second = $Restore.Items[0] | ConvertTo-Json | ConvertFrom-Json
         $Second.SrcDatabaseName = 'second-db'
         $Second.TrgDatabaseName = 'second-db'
-        $Second.BackupStorageContainerName = 'second-db'
         $Restore.Items = @($Restore.Items[0], $Second)
     }
     It 'Checks every restore target before allowing work and rejects a later network failure' {
@@ -209,24 +308,31 @@ Describe 'Read-only data-migration preflight' -Tag 'Unit' {
             }
         }
         Mock Get-AzDataMigrationSqlService {
-            [pscustomobject]@{ ProvisioningState = 'Succeeded'; IntegrationRuntimeState = $RuntimeState }
+            [pscustomobject]@{ Name = 'test-dms'; ProvisioningState = 'Succeeded'; IntegrationRuntimeState = $RuntimeState }
         }
         Invoke-DataMigrationPreflight -Operation "Restore-$Platform" -Configuration $Restore -Options $Options
         Should -Invoke Assert-ServiceTcpEndpoint -Times 2 -Exactly
     }
-    It 'Reports missing SQL migration services separately from runtime state' {
+    It 'Allows a missing SQL migration service without creating it during preflight' {
         Mock Get-AzDataMigrationSqlService { $null }
+        Invoke-DataMigrationPreflight -Operation 'Restore-SQLMI' -Configuration $Restore -Options $Options
+        Should -Invoke Assert-ServiceTcpEndpoint -Times 2 -Exactly
+        Should -Invoke New-AzDataMigrationSqlService -Times 0 -Exactly
+        Should -Invoke Write-Host -Times 2 -Exactly -ParameterFilter { $Object -like '*live Restore will create*' }
+    }
+    It 'Does not mistake failed service discovery for a missing service' {
+        Mock Get-AzDataMigrationSqlService { throw 'DMS resource access denied' }
         { Invoke-DataMigrationPreflight -Operation 'Restore-SQLMI' -Configuration $Restore -Options $Options } |
-            Should -Throw '*DMS SQL service*was not returned*'
-        Should -Invoke Assert-ServiceTcpEndpoint -Times 0 -Exactly
+            Should -Throw '*DMS resource access denied*'
+        Should -Invoke New-AzDataMigrationSqlService -Times 0 -Exactly
     }
     It 'Rejects unsuccessfully provisioned DMS services' {
-        Mock Get-AzDataMigrationSqlService { [pscustomobject]@{ ProvisioningState = 'Failed' } }
+        Mock Get-AzDataMigrationSqlService { [pscustomobject]@{ Name = 'test-dms'; ProvisioningState = 'Failed' } }
         { Invoke-DataMigrationPreflight -Operation 'Restore-SQLMI' -Configuration $Restore -Options $Options } |
             Should -Throw '*not successfully provisioned*'
     }
     It 'Rejects a DMS service in a different region' {
-        Mock Get-AzDataMigrationSqlService { [pscustomobject]@{ ProvisioningState = 'Succeeded'; Location = 'different-region' } }
+        Mock Get-AzDataMigrationSqlService { [pscustomobject]@{ Name = 'test-dms'; ProvisioningState = 'Succeeded'; Location = 'different-region' } }
         { Invoke-DataMigrationPreflight -Operation 'Restore-SQLMI' -Configuration $Restore -Options $Options } |
             Should -Throw '*Location does not match*'
     }
@@ -299,6 +405,29 @@ Describe 'Read-only data-migration preflight' -Tag 'Unit' {
         { Invoke-DataMigrationPreflight -Operation 'Restore-SQLMI' -Configuration $Restore -Options $Options } |
             Should -Throw '*No account key*'
     }
+    It 'Requires populated existing source containers in <Platform> restore preflight: <Failure>' -ForEach @(
+        @{ Platform = 'SQLVM'; Failure = 'Missing' }, @{ Platform = 'SQLMI'; Failure = 'Missing' }
+        @{ Platform = 'SQLVM'; Failure = 'Empty' }, @{ Platform = 'SQLMI'; Failure = 'Empty' }
+    ) {
+        if ($Platform -eq 'SQLVM') {
+            foreach ($Item in $Restore.Items) {
+                $Item | Add-Member -NotePropertyName TrgSQLVM -NotePropertyValue 'target-vm'
+                $Item | Add-Member -NotePropertyName TrgSQLVMResourceGroup -NotePropertyValue 'target-rg'
+            }
+        }
+        $Restore.Items[0].SrcServerName = 'SoUrCe\InStAnCe'
+        $Restore.Items[0].SrcDatabaseName = 'AppDb'
+        $Restore.Items[0].TrgDatabaseName = 'RenamedDb'
+        Mock Assert-ServiceStorage {
+            if ($Failure -eq 'Missing') { throw 'Backup container does not exist' }
+            @()
+        }
+        { Invoke-DataMigrationPreflight -Operation "Restore-$Platform" -Configuration $Restore -Options $Options } |
+            Should -Throw
+        Should -Invoke Assert-ServiceStorage -Times 1 -Exactly -ParameterFilter {
+            $Container -eq 'source-instance-appdb' -and -not $AllowMissingContainer
+        }
+    }
     It 'Validates every selected disk or share root before storage or upload work' {
         $Folder = Join-Path $TestDrive 'source\full'
         $null = New-Item -ItemType Directory -Path $Folder -Force
@@ -319,9 +448,9 @@ Describe 'Read-only data-migration preflight' -Tag 'Unit' {
         $Executable = Join-Path $TestDrive 'azcopy.exe'
         Set-Content -LiteralPath $Executable -Value 'offline executable placeholder'
         $Copy = Read-ServiceConfiguration -Path (Join-Path $DataScripts '..\config\Invoke-CopyBackup-OnPrem-AzureBlob.config.json')
+        $Copy.Items = @($Copy.Items[0])
         $Second = $Copy.Items[0] | ConvertTo-Json | ConvertFrom-Json
         $Second.SrcDatabaseName = 'CDC_Director_PRO'
-        $Second.BackupContainerName = 'desktop-sga61qp-dmf-cdc-director-pro'
         $Copy.Items += $Second
         $Copy.Items | ForEach-Object { $_.IsActive = 'Y'; $_.BackupRootPath = Split-Path $Folder }
         $Path = Join-Path $TestDrive 'copy.json'

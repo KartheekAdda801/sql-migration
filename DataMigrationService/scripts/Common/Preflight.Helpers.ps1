@@ -31,6 +31,7 @@ function Invoke-DataMigrationPreflight {
         Assert-ServiceFields -Items $Items -Required SrcServerName, SrcDatabaseName, BackupRootPath, IsActive, BackupStorageAccountName
         foreach ($Item in $Items) {
             if ($Item.IsActive -notmatch '^[YN]$') { throw 'IsActive must be Y or N.' }
+            $null = Get-ContainerName -ServerName $Item.SrcServerName -DatabaseName $Item.SrcDatabaseName
         }
         Assert-MigrationTimestampOptions -TimestampPattern $Options.TimestampPattern -TimestampFormat $Options.TimestampFormat
         $Selected = @($Items | Where-Object { $_.IsActive -eq 'Y' -or $Options.CheckLatestBak -eq 'Y' })
@@ -67,12 +68,11 @@ function Invoke-DataMigrationPreflight {
                 if ($LASTEXITCODE -ne 0) { throw "AzCopy login failed (exit $LASTEXITCODE)." }
             }
             foreach ($Item in $Selected) {
-                $Container = [string]$Item.BackupContainerName
-                if ([string]::IsNullOrWhiteSpace($Container)) {
-                    $Container = Get-ContainerName -ServerName $Item.SrcServerName -DatabaseName $Item.SrcDatabaseName
-                }
-                $null = Assert-ServiceStorage -Account $Item.BackupStorageAccountName -Container $Container
-                Assert-DataMigrationAzCopyAccess -Executable $Executable -Destination "https://$($Item.BackupStorageAccountName).blob.core.windows.net/$Container"
+                $Container = Get-ContainerName -ServerName $Item.SrcServerName -DatabaseName $Item.SrcDatabaseName
+                $Storage = Assert-ServiceStorage -Account $Item.BackupStorageAccountName -Container $Container -AllowMissingContainer
+                $Destination = "https://$($Item.BackupStorageAccountName).blob.core.windows.net"
+                if ($Storage.ContainerExists) { $Destination += "/$Container" }
+                Assert-DataMigrationAzCopyAccess -Executable $Executable -Destination $Destination
             }
             Write-Warning 'Storage reads do not prove AzCopy write access. AzCopy authentication must also be configured for the executor.'
         }
@@ -85,6 +85,7 @@ function Invoke-DataMigrationPreflight {
             "Trg${Platform}ResourceGroup", 'TrgDatabaseName', 'DMSServiceName', 'DMSResourceGroup', 'TargetSqlHost')
         $Targets = @{}
         foreach ($Item in $Items) {
+            $null = Get-ContainerName -ServerName $Item.SrcServerName -DatabaseName $Item.SrcDatabaseName
             Assert-ServiceGuid -Name SubscriptionId -Value $Item.SubscriptionId
             $Key = "$($Item.SubscriptionId)|$($Item."Trg${Platform}ResourceGroup")|$($Item."Trg$Platform")|$($Item.TrgDatabaseName)"
             if ($Targets.ContainsKey($Key)) { throw "Duplicate target database configuration: $Key" }
@@ -104,20 +105,21 @@ function Invoke-DataMigrationPreflight {
             if ($Options.BlobAuthType -eq 'AccountKey' -and $Storage.Properties.allowSharedKeyAccess -eq $false) {
                 throw "Shared-key access is disabled on storage account '$($Item.BackupStorageAccount)'. AccountKey restore cannot proceed."
             }
-            $Container = [string]$Item.BackupStorageContainerName
-            if (-not $Container) { $Container = Get-ContainerName -ServerName $Item.SrcServerName -DatabaseName $Item.SrcDatabaseName }
+            $Container = Get-ContainerName -ServerName $Item.SrcServerName -DatabaseName $Item.SrcDatabaseName
             $Blobs = @(Assert-ServiceStorage -Account $Item.BackupStorageAccount -Container $Container)
             $Full = @($Blobs | Where-Object {
                 [IO.Path]::GetExtension($_.Name) -eq '.bak' -and
                 $null -ne (Get-MigrationBackupTimestamp -FileName $_.Name -TimestampPattern $Options.TimestampPattern -TimestampFormat $Options.TimestampFormat)
             })
             if (-not $Full.Count) { throw "No timestamped FULL backup found in '$Container'." }
-            $Service = Get-AzDataMigrationSqlService -Name $Item.DMSServiceName -ResourceGroupName $Item.DMSResourceGroup -ErrorAction Stop
-            if (-not $Service) {
-                throw "DMS SQL service '$($Item.DMSServiceName)' was not returned in resource group '$($Item.DMSResourceGroup)'. Verify the service name, subscription, and access. If the service itself was deleted, recreate it before restoring; the script creates database migration records, not the DMS service."
+            $Service = Get-DMSConfiguredSqlService -Item $Item
+            if ($Service) {
+                Assert-DMSConfiguredSqlService -Item $Item -Service $Service
             }
-            if ($Service.Location -and $Service.Location -ne $Item.Location) { throw "Configured Location does not match DMS '$($Item.DMSServiceName)'." }
-            if ($Service.ProvisioningState -and $Service.ProvisioningState -ne 'Succeeded') { throw "DMS '$($Item.DMSServiceName)' is not successfully provisioned." }
+            else {
+                $null = Get-Command New-AzDataMigrationSqlService -ErrorAction Stop
+                Write-Host "DMS SQL service '$($Item.DMSServiceName)' is missing in '$($Item.DMSResourceGroup)'; live Restore will create it in '$($Item.Location)' after validation."
+            }
             $Provider = if ($Platform -eq 'SQLMI') { 'Microsoft.Sql/managedInstances' } else { 'Microsoft.SqlVirtualMachine/sqlVirtualMachines' }
             $TargetId = "/subscriptions/$($Item.SubscriptionId)/resourceGroups/$($Item."Trg${Platform}ResourceGroup")/providers/$Provider/$($Item."Trg$Platform")"
             $Target = Get-AzResource -ResourceId $TargetId -ExpandProperties -ErrorAction Stop

@@ -8,6 +8,13 @@ function Read-ServiceConfiguration {
     param([Parameter(Mandatory)][string]$Path, [string]$Operation)
 
     $Configuration = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    Assert-DMSContainerConfiguration -Value $Configuration
+    foreach ($Name in @('Settings', 'Common', 'Items')) {
+        $Property = $Configuration.PSObject.Properties[$Name]
+        if ($Property) {
+            foreach ($Section in @($Property.Value)) { Assert-DMSContainerConfiguration -Value $Section }
+        }
+    }
     if ($Configuration.schemaVersion -eq 2) {
         if ($Operation -and $Operation -ne 'Invoke-RestoreDMS') {
             throw "Item-based configuration is supported only by Invoke-RestoreDMS.ps1, not '$Operation'."
@@ -35,11 +42,23 @@ function Assert-DMSConfigurationProperties {
     param([object]$Value, [string]$Section, [string[]]$Required, [string[]]$Optional = @())
 
     if ($Value -isnot [pscustomobject]) { throw "DMS configuration '$Section' must be an object." }
+    Assert-DMSContainerConfiguration -Value $Value
     foreach ($Name in $Required) {
         if (-not $Value.PSObject.Properties[$Name]) { throw "DMS configuration '$Section.$Name' is required." }
     }
     foreach ($Property in $Value.PSObject.Properties) {
         if ($Property.Name -notin ($Required + $Optional)) { throw "Unknown DMS configuration property '$Section.$($Property.Name)'." }
+    }
+}
+
+function Assert-DMSContainerConfiguration {
+    [CmdletBinding()]
+    param([AllowNull()][object]$Value)
+
+    foreach ($Name in @('BackupContainerName', 'BackupStorageContainerName')) {
+        if ($null -ne $Value -and $Value.PSObject.Properties[$Name]) {
+            throw "Obsolete configuration field '$Name'. Remove it and use SrcServerName/SrcDatabaseName; the backup container is derived from the source mapping."
+        }
     }
 }
 
@@ -102,6 +121,7 @@ function Assert-ServiceFields {
     $Index = 0
     foreach ($Item in $Items) {
         $Index++
+        Assert-DMSContainerConfiguration -Value $Item
         foreach ($Name in $Required) {
             $Property = $Item.PSObject.Properties[$Name]
             if (-not $Property -or [string]::IsNullOrWhiteSpace([string]$Property.Value) -or
@@ -171,7 +191,7 @@ function Assert-ServiceGuid {
 
 function Assert-ServiceStorage {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Account, [string]$Container)
+    param([Parameter(Mandatory)][string]$Account, [string]$Container, [switch]$AllowMissingContainer)
 
     if ($Account -notmatch '^[a-z0-9]{3,24}$') { throw "Invalid backup storage account '$Account'." }
     Assert-ServiceTcpEndpoint -HostName "$Account.blob.core.windows.net"
@@ -182,8 +202,12 @@ function Assert-ServiceStorage {
             throw "Invalid backup container '$Container'."
         }
         if ($Container -in $Containers.Name) {
-            return @(Get-AzStorageBlob -Container $Container -Context $Context -ErrorAction Stop)
+            $Blobs = @(Get-AzStorageBlob -Container $Container -Context $Context -ErrorAction Stop)
+            if ($AllowMissingContainer) { return [pscustomobject]@{ ContainerExists = $true } }
+            return $Blobs
         }
+        # Only copy opts into this read-only result. Creation remains an execution step.
+        if ($AllowMissingContainer) { return [pscustomobject]@{ ContainerExists = $false } }
         throw "Backup container '$Container' does not exist in '$Account'. Create it before running this workflow."
     }
     Write-Warning 'Read-only storage checks passed. They cannot prove future write permission, capacity, or upload success.'

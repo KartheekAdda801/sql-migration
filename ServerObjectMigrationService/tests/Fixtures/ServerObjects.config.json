@@ -31,6 +31,7 @@
       "SQLAlertsMigrationFlag": "Yes",
       "SQLDBMailMigrationFlag": "No",
       "TargetType": "SQLVM",
+      "TargetWindowsDomain": "EXAMPLE",
       "TargetName": "akpersonalsqlvm",
       "TargetSqlHost": "vm.example",
       "TargetSqlPort": 1433,
@@ -39,7 +40,7 @@
       "Logins": [
         { "Name": "dbmigration", "Type": "SqlLogin", "SecretName": "sql-dbmigration-pwd", "AccessType": ["db_datareader"], "ForcePasswordReset": false },
         { "Name": "dbtestuser", "Type": "SqlLogin", "SecretName": "sql-dbtestuser-pwd", "AccessType": ["db_datawriter"], "ForcePasswordReset": false },
-        { "Name": "user@example.com", "Type": "EntraUser", "AccessType": ["db_datareader"] }
+        { "Name": "EXAMPLE\\testuser", "Type": "WindowsAD", "AccessType": ["db_datareader"] }
       ]
     },
     {

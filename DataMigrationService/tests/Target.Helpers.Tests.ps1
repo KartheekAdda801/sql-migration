@@ -21,7 +21,7 @@ BeforeAll {
 
 Describe 'Target SQL preflight and authentication' -Tag 'Unit' {
     BeforeEach {
-        $Config = Read-ServiceConfiguration (Join-Path $PSScriptRoot '..\config\Invoke-RestoreDMS.config.json')
+        $Config = Read-ServiceConfiguration (Join-Path $PSScriptRoot 'Fixtures\Restore.config.json')
         $Config.Common.TargetSqlAuthType = ''
         $Config.Common | Add-Member -NotePropertyMembers @{
             SqlCredentialMode = 'Interactive'; SqlCredentialPath = ''; SqlUserName = ''; credential = ''
@@ -244,7 +244,7 @@ Describe 'Target SQL preflight and authentication' -Tag 'Unit' {
 
 Describe 'Explicitly approved target replacement' -Tag 'Unit' {
     BeforeEach {
-        $Config = Read-ServiceConfiguration (Join-Path $PSScriptRoot '..\config\Invoke-RestoreDMS.config.json')
+        $Config = Read-ServiceConfiguration (Join-Path $PSScriptRoot 'Fixtures\Restore.config.json')
         $Plan = @(New-DMSItemPlan -Items @(Resolve-DMSConfigurationItems $Config))
         foreach ($Entry in $Plan) {
             $Entry | Add-Member -NotePropertyName RestoreState -NotePropertyValue ([pscustomobject]@{

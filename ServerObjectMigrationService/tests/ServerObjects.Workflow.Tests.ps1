@@ -61,10 +61,11 @@ Describe 'WhatIf item selection and preflight diagnostics' -Tag 'Unit' {
             }
             Items = @(@{
                 Id = 'VM-Objects'; Enabled = $true; TargetType = 'SQLVM'; TargetName = 'target-vm'
+                TargetWindowsDomain = 'EXAMPLE'
                 TargetSqlHost = 'target.example'; TargetSqlPort = 1433
                 SourceServerName = 'source\instance'; SourceListofDatabases = 'AppDb'
                 StorageContainer = 'test-objects'; ProvisionLogins = $true
-                Logins = @(@{ Name = 'user@example.com'; Type = 'EntraUser'; AccessType = @('db_datareader') })
+                Logins = @(@{ Name = 'EXAMPLE\testuser'; Type = 'WindowsAD'; AccessType = @('db_datareader') })
             })
         } | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $PreviewConfiguration
     }

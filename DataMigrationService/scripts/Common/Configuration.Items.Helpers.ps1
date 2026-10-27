@@ -21,7 +21,7 @@ function Resolve-DMSConfigurationItems {
     $Defaults = [ordered]@{
         Enabled = $true; Activity = 'Status'; SubscriptionId = ''; ResourceGroupName = ''; Location = ''
         SrcServerName = ''; SrcDatabaseName = ''; BackupStorageAccount = ''; BackupStorageResourceGroup = ''
-        BackupStorageContainerName = ''; TargetType = ''; TargetName = ''; TargetResourceGroup = ''
+        TargetType = ''; TargetName = ''; TargetResourceGroup = ''
         TargetSqlHost = ''; TargetSqlPort = 1433; TargetTrustServerCertificate = $false; SqlCredentialPath = ''
         SqlUserName = ''; SqlPasswordEnvironmentVariable = ''; TargetSqlAuthType = ''; SqlCredentialMode = 'Interactive'; credential = ''
         TrgDatabaseName = ''; DMSServiceName = ''; DMSResourceGroup = ''
@@ -92,6 +92,7 @@ function Resolve-DMSConfigurationItems {
             if (-not $SeenTargets.Add($Key)) { throw "Duplicate target database configuration: $Key" }
             if ($Item.Activity -eq 'Restore') {
                 Assert-ServiceFields -Items @($Item) -Required SrcServerName, SrcDatabaseName, BackupStorageAccount, BackupStorageResourceGroup, Location, TargetSqlHost
+                $null = Get-ContainerName -ServerName $Item.SrcServerName -DatabaseName $Item.SrcDatabaseName
             }
         }
         $Item
@@ -108,7 +109,7 @@ function ConvertTo-DMSItemConfiguration {
         foreach ($Name in @('AutoCutover', 'BlobAuthType', 'BlobIdentityType', 'BlobUserAssignedIdentity',
             'TimestampPattern', 'TimestampFormat', 'TargetSqlPort')) { $Settings[$Name] = $Item.$Name }
         $Row = [ordered]@{}
-        foreach ($Name in @('SrcServerName', 'SrcDatabaseName', 'BackupStorageAccount', 'BackupStorageContainerName',
+        foreach ($Name in @('SrcServerName', 'SrcDatabaseName', 'BackupStorageAccount',
             'BackupStorageResourceGroup', 'SubscriptionId', 'Location', 'TargetSqlHost')) { $Row[$Name] = $Item.$Name }
         $Row["Trg$($Item.TargetType)"] = $Item.TargetName
         $Row["Trg$($Item.TargetType)ResourceGroup"] = $Item.TargetResourceGroup

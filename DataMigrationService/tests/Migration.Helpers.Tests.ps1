@@ -63,6 +63,37 @@ BeforeAll {
 
 }
 
+Describe 'Source-derived backup container naming' -Tag 'Unit' {
+    It 'Preserves normalization for <Server> and <Database>' -ForEach @(
+        @{ Server = 'SQLServerMigVM'; Database = 'MIGRDEMO'; Expected = 'sqlservermigvm-migrdemo' }
+        @{ Server = 'SeRvEr\InStAnCe'; Database = 'AppDb'; Expected = 'server-instance-appdb' }
+        @{ Server = 'Server.Name\SQL_Instance'; Database = ' App__ DB-- '; Expected = 'server-name-sql-instance-app-db' }
+        @{ Server = 'a'; Database = 'b'; Expected = 'a-b' }
+        @{ Server = 'a'; Database = '_'; Expected = 'db-a' }
+        @{ Server = 'SERVER'; Database = '应用'; Expected = 'server' }
+    ) {
+        Get-ContainerName -ServerName $Server -DatabaseName $Database | Should -BeExactly $Expected
+    }
+    It 'Retains 63-character truncation and trims the resulting trailing separator' {
+        Get-ContainerName -ServerName ('s' * 70) -DatabaseName 'db' | Should -BeExactly ('s' * 63)
+        Get-ContainerName -ServerName ('s' * 62) -DatabaseName 'db' | Should -BeExactly ('s' * 62)
+    }
+    It 'Rejects malformed source server or instance <Server>' -ForEach @(
+        @{ Server = '' }, @{ Server = ' ' }, @{ Server = '\instance' }, @{ Server = 'server\' }
+        @{ Server = 'server\\instance' }, @{ Server = 'server\instance\extra' }
+        @{ Server = '<server>' }, @{ Server = 'server/instance' }, @{ Server = 'tcp:server,1433' }
+        @{ Server = 'server\ ' }, @{ Server = '---' }
+    ) {
+        { Get-ContainerName -ServerName $Server -DatabaseName 'db' } | Should -Throw '*SrcServerName*'
+    }
+    It 'Rejects malformed source database <Database>' -ForEach @(
+        @{ Database = '' }, @{ Database = ' ' }, @{ Database = '<database>' }
+        @{ Database = "db`nname" }
+    ) {
+        { Get-ContainerName -ServerName 'server' -DatabaseName $Database } | Should -Throw '*SrcDatabaseName*'
+    }
+}
+
 Describe 'Backup timestamps' -Tag 'Unit' {
     It 'Parses built-in <Name>' -ForEach @(
         @{ Name = 'db_20250102_030405.bak'; Expected = '2025-01-02T03:04:05' }

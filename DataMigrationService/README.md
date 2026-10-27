@@ -33,6 +33,45 @@ local password file, an encrypted credential file, or a password environment var
 > mappings. Running without `-WhatIf` starts live work. Use `-Activity Status`
 > explicitly to inspect status without submitting restores.
 
+## Source-derived backup containers
+
+Copy and both SQLVM/SQLMI restores use the same `Get-ContainerName` helper.
+`SrcServerName` plus `SrcDatabaseName` determines the container:
+
+* `SQLServerMigVM` and `MIGRDEMO` map to `sqlservermigvm-migrdemo`
+* `SERVER\INSTANCE` and `AppDb` map to `server-instance-appdb`
+
+In JSON, escape the instance separator: `"SrcServerName": "SERVER\\INSTANCE"`.
+The helper uses invariant lowercase, replaces characters outside `a-z`, `0-9`,
+and hyphens with hyphens, collapses and trims hyphens, prefixes `db-` for
+names shorter than three characters, and truncates to 63 characters (trimming
+a trailing hyphen). Existing normalization is unchanged; long or sanitized
+source names can collide, so review the derived mapping before copying.
+Source server/instance components and database names must not be empty or
+placeholders. Use the original source database even when `TrgDatabaseName`
+renames the target. Restore needs source fields; Status, Monitor, and Cutover
+do not require them solely for discovery.
+
+Live copy runs `azcopy make` before uploading to the flat container root.
+An existing container is accepted. Preflight and `-WhatIf` never create
+containers or upload: they check the Azure PowerShell account and storage
+reads and authenticate AzCopy by listing the container, or the account when
+the container is missing. Authenticate Azure PowerShell with `Connect-AzAccount`
+and configure AzCopy authentication separately (or use `-InteractiveLogin`).
+The executor needs account/container list access, container creation permission,
+and Blob upload permission. Read-only preflight cannot prove future writes;
+creation failures stop that row and are reported as execution failures.
+Restore remains strict: the derived container must already exist and contain
+usable timestamped FULL backups.
+
+When upgrading, remove obsolete `BackupContainerName` (copy) and
+`BackupStorageContainerName` (restore) properties, including blank properties.
+Configuration rejects them with removal guidance; they are not overrides.
+Existing differently named containers are not renamed or searched automatically.
+Copy the backups into the derived container before restoring, or update the
+source mapping to the actual original source. Do not change the source mapping
+merely to emulate a former override.
+
 ## Common defaults and per-database overrides
 
 The DMS file has only `schemaVersion`, `Common`, and `Items`. Each item is one
@@ -59,7 +98,6 @@ array; there are no separate target, restore, or control sections.
       "Activity": "",
       "SrcServerName": "DESKTOP-SGA61QP\\DMF",
       "SrcDatabaseName": "MIGRDEMO",
-      "BackupStorageContainerName": "desktop-sga61qp-dmf-migrdemo",
       "TargetType": "SQLVM",
       "TargetName": "akpersonalsqlvm",
       "TargetSqlHost": "akpersonalsqlvm.centralus.cloudapp.azure.com",
@@ -71,7 +109,6 @@ array; there are no separate target, restore, or control sections.
       "Activity": "",
       "SrcServerName": "DESKTOP-SGA61QP\\DMF",
       "SrcDatabaseName": "MIGRDEMO",
-      "BackupStorageContainerName": "desktop-sga61qp-dmf-migrdemo",
       "TargetType": "SQLMI",
       "TargetName": "ak-personal-sqlmi",
       "TargetSqlHost": "ak-personal-sqlmi.public.3c52841dc1d0.database.windows.net",
@@ -105,7 +142,7 @@ Its supported range is 1 through 10.
 | `Enabled`, `Activity` | Select participation and Restore/Status/Monitor/Cutover/Remove; built-in defaults true and Status; operational file currently selects Restore |
 | `SubscriptionId`, `ResourceGroupName`, `Location` | Subscription and fallback resource group for this mapping; DMS region |
 | `SrcServerName`, `SrcDatabaseName` | Original backup source instance and database |
-| `BackupStorageAccount`, `BackupStorageResourceGroup`, `BackupStorageContainerName` | Existing source backup account, resource group, and flat Blob container |
+| `BackupStorageAccount`, `BackupStorageResourceGroup` | Existing source backup account and resource group; flat Blob container derived from the source mapping |
 | `TargetType`, `TargetName`, `TargetResourceGroup` | SQLVM or SQLMI and its Azure resource name/group |
 | `TargetSqlHost`, `TargetSqlPort` | Executor SQL hostname and TCP port for either target type; host required for Restore, without `tcp:` or port suffix; item overrides Common, port defaults 1433 only if neither supplies it |
 | `SqlCredentialPath` | DPAPI-encrypted PSCredential file for SQL-login access on either target; Interactive mode prefers login entry |
@@ -115,7 +152,7 @@ Its supported range is 1 through 10.
 | `SqlUserName`, `SqlPasswordEnvironmentVariable` | Alternative configured SQL login: username and the name of a password environment variable, never the password itself |
 | `TargetTrustServerCertificate` | Defaults false; explicitly opt in only when accepting a known self-signed SQL certificate is necessary |
 | `TrgDatabaseName` | Exact target database name |
-| `DMSServiceName`, `DMSResourceGroup` | Existing SQL migration service and its discovery group |
+| `DMSServiceName`, `DMSResourceGroup` | SQL migration service name and group; Restore creates a missing service using `Location` |
 | `BlobAuthType`, `BlobIdentityType`, `BlobUserAssignedIdentity` | Backup authentication: blank auth type defaults to AccountKey for VM, ManagedIdentity for MI; identity defaults SystemAssigned |
 | `AutoCutover` | Defaults false; does not freeze source writes or upload final logs |
 | `TimestampPattern`, `TimestampFormat` | Optional paired custom backup filename timestamp parser |
@@ -138,7 +175,6 @@ For example, edit an MI item without changing any other mapping:
   "SrcDatabaseName": "AnotherDb",
   "BackupStorageAccount": "anotherbackupaccount",
   "BackupStorageResourceGroup": "backup-rg",
-  "BackupStorageContainerName": "another-source-anotherdb",
   "TargetType": "SQLMI",
   "TargetName": "another-mi",
   "TargetResourceGroup": "target-rg",
@@ -604,8 +640,11 @@ DMS migration creation runs in process-isolated batches governed by
 next 10 start. There is no wait for database restoration or cutover between
 batches. All 20 accepted migrations can restore concurrently in Azure.
 Each process imports the Azure context independently, avoiding cross-subscription
-context races. This creates database migration records under existing DMS
-services, not separate DMS services.
+context races. Before submitting restores, the workflow reuses each configured
+DMS SQL service or creates it if missing, using `DMSServiceName`, `DMSResourceGroup`,
+`SubscriptionId`, and `Location`. Items sharing the same service create it only
+once before the concurrent submission batches. Conflicting locations for a shared
+service are rejected. Service creation failure stops restore submission.
 
 One item's creation, restore, or monitoring failure is recorded without blocking
 the other selected restores. The final workflow is failed if any item has failed
@@ -677,10 +716,16 @@ installed cmdlet supports them. SQL VM requires AccountKey; the executor needs
 listKeys permission and the storage account must allow shared-key access.
 No authentication fallback is applied.
 
-Pre-create containers, target resources, and the SQL migration service.
-Deleting database migration records/projects allows a new Restore run to create
-them again. If you deleted the DMS SQL service itself, recreate it first;
-preflight stops rather than provisioning a replacement.
+Upload backups first; the copy script creates the source-derived container.
+Restore requires that container and its backups, plus existing target resources
+and resource groups. It creates a missing configured SQL migration service with
+`New-AzDataMigrationSqlService`, then creates the database migration records.
+The executor needs service-management permissions, such as Contributor on the DMS
+resource group; Storage Blob Data Contributor alone does not grant these permissions.
+Read-only preflight and `-WhatIf` report planned service creation without creating
+resources. Status, Monitor, Cutover, and Remove never create services. Access,
+network, resource-group, and provisioning errors stop the workflow rather than
+being treated as a missing service. Existing services are not reconfigured.
 Blob-source restore does not require a self-hosted integration runtime to report
 Online; network-share workflows have different requirements.
 Preflight checks resource fields, duplicate target databases, module

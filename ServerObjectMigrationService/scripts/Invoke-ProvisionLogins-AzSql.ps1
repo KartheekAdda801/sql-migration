@@ -9,7 +9,8 @@
     Provision item-specific SQL and external logins and database access.
 .DESCRIPTION
     Reads a JSON configuration and applies the requested login, user and access changes.
-    SQL logins use per-login Key Vault secrets. External logins use Entra identities.
+    SQL logins use per-login Key Vault secrets. SQLVM also supports Windows AD
+    users; SQLMI supports Entra users, groups and managed identities.
     This does not copy source password hashes or SIDs.
 .PARAMETER ConfigPath
     Shared schemaVersion 2 configuration, or private worker input from the orchestrator.
@@ -374,6 +375,51 @@ END
     }
 }
 
+function Ensure-WindowsADLogin {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ServerName,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$AccessToken,
+        [Parameter(Mandatory)][string]$LoginName,
+        [Parameter(Mandatory)][string]$TargetWindowsDomain
+    )
+    $ValidationSql = Get-ServerObjectWindowsLoginValidationSql -LoginName $LoginName -TargetWindowsDomain $TargetWindowsDomain
+    $ReportedDomain = Invoke-SqlScalar -ServerName $ServerName -Port $Port -Database master -AccessToken $AccessToken `
+        -Sql 'SELECT DEFAULT_DOMAIN();'
+    if ([string]::IsNullOrWhiteSpace([string]$ReportedDomain)) {
+        throw 'Target SQL Server did not report a default Windows domain.'
+    }
+    if ([string]$ReportedDomain -ine $TargetWindowsDomain) {
+        throw 'Target SQL Server default Windows domain does not match TargetWindowsDomain.'
+    }
+    $Literal = Quote-SqlString -Value $LoginName
+    $Bracket = Quote-SqlIdentifier -Name $LoginName
+    # Repeat the read-only preflight checks in the write batch, before CREATE.
+    $Sql = @"
+SET XACT_ABORT ON;
+BEGIN TRY
+BEGIN TRANSACTION;
+$ValidationSql
+DECLARE @Created bit = 0;
+IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = $Literal)
+BEGIN
+    CREATE LOGIN $Bracket FROM WINDOWS;
+    SET @Created = 1;
+END;
+IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = $Literal AND type = 'U' AND sid = @ExpectedSid)
+    THROW 51000, 'WindowsAD login SID/type verification failed. No database access was granted.', 1;
+COMMIT TRANSACTION;
+SELECT CASE WHEN @Created = 1 THEN 'Created' ELSE 'AlreadyExists' END;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+    THROW;
+END CATCH;
+"@
+    Invoke-SqlScalar -ServerName $ServerName -Port $Port -Database master -AccessToken $AccessToken -Sql $Sql
+}
+
 function Ensure-ExternalLogin {
     [CmdletBinding()]
     param(
@@ -425,7 +471,7 @@ function Ensure-DatabaseUserAndAccess {
         [AllowEmptyCollection()]
         [string[]]$AccessTypes,
 
-        [ValidateSet('S', 'E', 'X')]
+        [ValidateSet('S', 'U', 'E', 'X')]
         [string]$PrincipalType = 'S'
     )
 
@@ -620,6 +666,8 @@ foreach ($row in $rows) {
         $UseWindowsAuthentication = $AuthType -eq 'Windows'
         $loginName = $row.LoginName.Trim()
         $loginType = $row.LoginType
+        $Domain = if ($row.PSObject.Properties['TargetWindowsDomain']) { [string]$row.TargetWindowsDomain } else { '' }
+        Assert-ServerObjectLoginTarget -TargetType $targetType -LoginType $loginType -LoginName $loginName -TargetWindowsDomain $Domain
         $vaultName = $row.KeyVaultName.Trim()
         $secretName = $row.SecretName.Trim()
         $database = $row.Database.Trim()
@@ -661,6 +709,10 @@ foreach ($row in $rows) {
                 if ($loginType -eq 'SqlLogin') {
                     $loginAction = New-OrUpdate-SqlLogin -ServerName $serverFqdn -Port $SqlPort -AccessToken $sqlToken -LoginName $loginName -Password $password -ResetIfExists:$row.ForcePasswordReset
                 }
+                elseif ($loginType -eq 'WindowsAD') {
+                    $loginAction = Ensure-WindowsADLogin -ServerName $serverFqdn -Port $SqlPort -AccessToken $sqlToken `
+                        -LoginName $loginName -TargetWindowsDomain $Domain
+                }
                 else {
                     $principalType = if ($loginType -eq 'EntraGroup') { 'X' } else { 'E' }
                     $loginAction = Ensure-ExternalLogin -ServerName $serverFqdn -Port $SqlPort -AccessToken $sqlToken `
@@ -686,7 +738,7 @@ foreach ($row in $rows) {
             Write-Host "Deferred database access for '$loginName' in '$database' until All execution after restore."
         }
         elseif ($PSCmdlet.ShouldProcess("$serverFqdn/$database", "Ensure user '$loginName' and apply access '$($accessTypes -join ',')'")) {
-            $principalType = if ($loginType -eq 'SqlLogin') { 'S' } elseif ($loginType -eq 'EntraGroup') { 'X' } else { 'E' }
+            $principalType = if ($loginType -eq 'SqlLogin') { 'S' } elseif ($loginType -eq 'WindowsAD') { 'U' } elseif ($loginType -eq 'EntraGroup') { 'X' } else { 'E' }
             $dbResult = Ensure-DatabaseUserAndAccess -ServerName $serverFqdn -Port $SqlPort -Database $database -AccessToken $sqlToken -LoginName $loginName -AccessTypes $accessTypes -PrincipalType $principalType
         }
         else {

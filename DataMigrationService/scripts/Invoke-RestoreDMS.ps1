@@ -7,12 +7,20 @@
 .SYNOPSIS
     Run item-based SQL VM and SQL MI migrations using inherited common settings.
 .DESCRIPTION
-    Validates all selected database items before work. Migration submissions run
+    Validates all selected database items before work. Live Restore creates missing
+    configured SQL migration services before submitting database migrations.
+    Migration submissions run
     in batches of up to 10 independent processes. Accepted restores continue in
     Azure without blocking later batches. Execution runs in the background unless
     Foreground is supplied. Existing-target replacement requires one explicit
     approval before launch; all other execution is non-interactive.
     Confirm does not enable routine prompts. Use WhatIf to preview without mutation.
+    Restore derives the backup container with the same Get-ContainerName helper as
+    copy, from SrcServerName and SrcDatabaseName (never TrgDatabaseName):
+    servername-databasename or servername-instancename-databasename, normalized
+    to lowercase and limited to 63 characters. Restore requires that container
+    to exist and contain usable backups. Container overrides are not supported;
+    remove obsolete configured container fields. Containers are not renamed.
 .PARAMETER ConfigPath
     JSON file with Common defaults and source-to-target Items.
 .PARAMETER ItemId

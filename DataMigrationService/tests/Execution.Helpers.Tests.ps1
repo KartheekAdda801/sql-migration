@@ -11,7 +11,7 @@ BeforeAll {
 
 Describe 'Process-isolated parallel submissions' -Tag 'Unit' {
     BeforeEach {
-        $Config = Read-ServiceConfiguration (Join-Path $PSScriptRoot '..\config\Invoke-RestoreDMS.config.json')
+        $Config = Read-ServiceConfiguration (Join-Path $PSScriptRoot 'Fixtures\Restore.config.json')
         $Plan = @(New-DMSItemPlan -Items @(Resolve-DMSConfigurationItems $Config))
         Mock Write-DMSPlanResults {}
         Mock Write-Warning {}
@@ -70,7 +70,7 @@ Describe 'Process-isolated parallel submissions' -Tag 'Unit' {
 Describe 'Persistent background execution' -Tag 'Unit' {
     BeforeEach {
         $Directory = New-DMSRunDirectory -RootDirectory $TestDrive
-        $Config = Read-ServiceConfiguration (Join-Path $PSScriptRoot '..\config\Invoke-RestoreDMS.config.json')
+        $Config = Read-ServiceConfiguration (Join-Path $PSScriptRoot 'Fixtures\Restore.config.json')
         $Plan = @(New-DMSItemPlan -Items @(Resolve-DMSConfigurationItems $Config))
         Mock Save-AzContext { [IO.File]::WriteAllText($Path, 'offline-context') }
         Mock Disable-AzContextAutosave {}

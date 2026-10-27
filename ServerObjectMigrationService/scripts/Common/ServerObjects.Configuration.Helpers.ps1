@@ -35,7 +35,7 @@ function Get-ServerObjectDefaults {
         TargetTrustServerCertificate = $false
         TargetSqlAuthType = 'Auto'; credential = ''; SqlCredentialMode = 'Interactive'
         SqlCredentialPath = ''; SqlUserName = ''; SqlPasswordEnvironmentVariable = ''
-        TargetName = ''; TargetType = ''; TargetSqlHost = ''; TargetSqlPort = 0
+        TargetName = ''; TargetType = ''; TargetSqlHost = ''; TargetSqlPort = 0; TargetWindowsDomain = ''
         TenantId = ''; SubscriptionId = ''; JobOwnerUpnSuffix = ''; EntraIdentityMappings = @{}
         SQLAgentJobFilterCriteria = '.*'; SQLAgentJobsMigrationFlag = 'Yes'; SQLAgentJobsMigrationScope = 'All'
         SQLLoginsMigrationFlag = 'Yes'; SQLLoginsMigrationScope = 'All'
@@ -63,8 +63,10 @@ function ConvertTo-ServerObjectLogins {
             $Login.Name.Trim().Length -gt 128 -or $Login.Name -match '[\x00-\x1f]' -or -not $Names.Add($Login.Name.Trim())) {
             throw "Each login on '$($Item.Id)' needs a unique nonempty Name (maximum 128 characters)."
         }
-        if ($Login.Type -notin @('SqlLogin', 'EntraUser', 'EntraGroup', 'ManagedIdentity')) {
-            throw "Unsupported login Type '$($Login.Type)' on '$($Item.Id)'."
+        Assert-ServerObjectLoginTarget -TargetType $Item.TargetType -LoginType $Login.Type -LoginName $Login.Name.Trim() `
+            -TargetWindowsDomain $Item.TargetWindowsDomain
+        if ($Login.Type -eq 'WindowsAD' -and $Login.Contains('ObjectId')) {
+            throw 'WindowsAD cannot specify ObjectId; Windows AD resolution uses the target domain and Windows SID.'
         }
         if (-not $Login.Contains('AccessType') -or $Login.AccessType -isnot [array] -or
             @($Login.AccessType | Where-Object { $_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_) -or $_ -notmatch '^[A-Za-z_ ]+$' }).Count) {
@@ -268,12 +270,15 @@ function Get-ServerObjectProvisioningItems {
         throw 'ProvisionLogins requires explicit nonempty database names, not All.'
     }
     foreach ($Login in $Item.Logins) {
+        Assert-ServerObjectLoginTarget -TargetType $Item.TargetType -LoginType $Login.Type -LoginName $Login.Name `
+            -TargetWindowsDomain $Item.TargetWindowsDomain
         $Databases = if ($Login.Databases.Count) { @($Login.Databases) } else { $Scope }
         foreach ($Database in $Databases) {
             if ($Database -notin $Scope) { throw "Login '$($Login.Name)' requests database '$Database' outside the item's database scope." }
             [pscustomobject]@{
                 Application = $Item.Application; TargetServerName = $Item.TargetName
                 TargetServerFQDN = $Item.TargetSqlHost; TargetType = $Item.TargetType
+                TargetWindowsDomain = $Item.TargetWindowsDomain
                 TenantId = $Item.TenantId; SubscriptionId = $Item.SubscriptionId
                 LoginName = $Login.Name; LoginType = $Login.Type; ObjectId = $Login.ObjectId
                 KeyVaultName = $Item.KeyVaultName; SecretName = $Login.SecretName

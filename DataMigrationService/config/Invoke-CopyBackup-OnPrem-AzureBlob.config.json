@@ -3,10 +3,10 @@
   "Settings": {
     "Overwrite": "true",
     "InteractiveLogin": false,
-    "AzCopyPath": "C:\\AzCopy\\azcopy.exe",
+    "AzCopyPath": "C:\\Tools\\AzCopy\\azcopy.exe",
     "IncludeLogsAtSameTimestamp": false,
-    "TenantId": "b7d7daca-8689-49f9-8a9b-d20adf81c78b",
-    "SubscriptionId": "cd7743ef-8ddc-4254-b715-2c79c8ab4126",
+    "TenantId": "396b3622-063d-4ef2-9c28-383d840705b4",
+    "SubscriptionId": "bdac0d16-ad4b-4953-83f3-91b12451a425",
     "CheckLatestBak": "N",
     "TimestampPattern": "",
     "TimestampFormat": "",
@@ -14,12 +14,18 @@
   },
   "Items": [
     {
-      "SrcServerName": "DESKTOP-SGA61QP\\DMF",
+      "SrcServerName": "sqlservermigvm",
       "SrcDatabaseName": "MIGRDEMO",
-      "BackupRootPath": "C:\\Backups\\DESKTOP-SGA61QP$DMF\\MIGRDEMO",
+      "BackupRootPath": "C:\\Backups\\sqlservermigvm\\MIGRDEMO",
       "IsActive": "Y",
-      "BackupStorageAccountName": "akpersonalsa",
-      "BackupContainerName": "desktop-sga61qp-dmf-migrdemo"
+      "BackupStorageAccountName": "sqlmimigrationbackup"
+    },
+    {
+      "SrcServerName": "sqlservermigvm",
+      "SrcDatabaseName": "DBAdmin",
+      "BackupRootPath": "C:\\Backups\\sqlservermigvm\\DBAdmin",
+      "IsActive": "Y",
+      "BackupStorageAccountName": "sqlmimigrationbackup"
     }
   ]
 }

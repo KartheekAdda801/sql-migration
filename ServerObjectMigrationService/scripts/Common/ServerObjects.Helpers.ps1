@@ -1461,4 +1461,5 @@ function Write-ServerMigrationSummary {
 #endregion Functions
 
 . (Join-Path $PSScriptRoot 'Configuration.Helpers.ps1')
+. (Join-Path $PSScriptRoot 'ServerObjects.LoginProvisioning.Helpers.ps1')
 . (Join-Path $PSScriptRoot 'Preflight.Helpers.ps1')

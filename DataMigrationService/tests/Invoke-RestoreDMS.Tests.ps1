@@ -5,9 +5,13 @@
 BeforeAll {
     $Scripts = Join-Path $PSScriptRoot '..\scripts'
     . (Join-Path $Scripts 'Invoke-RestoreDMS.ps1')
-    $ReferencePath = Join-Path $Scripts '..\config\Invoke-RestoreDMS.config.json'
+    $ReferencePath = Join-Path $PSScriptRoot 'Fixtures\Restore.config.json'
     function Set-AzContext { [CmdletBinding(SupportsShouldProcess)]param($SubscriptionId, $Scope) throw 'Unmocked Azure call' }
-    function Get-AzDataMigrationSqlService { [CmdletBinding()]param($Name, $ResourceGroupName) throw 'Unmocked Azure call' }
+    function Get-AzDataMigrationSqlService { [CmdletBinding()]param($Name, $ResourceGroupName, $SubscriptionId) throw 'Unmocked Azure call' }
+    function New-AzDataMigrationSqlService {
+        [CmdletBinding(SupportsShouldProcess)]param($Name, $ResourceGroupName, $SubscriptionId, $Location)
+        throw 'Unmocked DMS service creation'
+    }
     function New-AzStorageContext { [CmdletBinding()]param($StorageAccountName, [switch]$UseConnectedAccount) throw 'Unmocked Azure call' }
     function Get-AzStorageBlob { [CmdletBinding()]param($Container, $Context) throw 'Unmocked Azure call' }
     function Get-AzStorageAccountKey { [CmdletBinding()]param($ResourceGroupName, $Name) throw 'Unmocked Azure call' }
@@ -35,6 +39,32 @@ BeforeAll {
 
 Describe 'Item-based DMS configuration inheritance' -Tag 'Unit' {
     BeforeEach { $Shared = Read-ServiceConfiguration -Path $ReferencePath }
+    It 'Rejects obsolete container fields in Common or Items, including blank overrides' -ForEach @(
+        @{ Section = 'Common'; Field = 'BackupStorageContainerName'; Value = '' }
+        @{ Section = 'Items'; Field = 'BackupStorageContainerName'; Value = 'old-container' }
+        @{ Section = 'Common'; Field = 'BackupContainerName'; Value = 'old-container' }
+        @{ Section = 'Items'; Field = 'BackupContainerName'; Value = '' }
+    ) {
+        $ValueObject = if ($Section -eq 'Common') { $Shared.Common } else { $Shared.Items[0] }
+        $ValueObject | Add-Member -NotePropertyName $Field -NotePropertyValue $Value
+        { Resolve-DMSConfigurationItems $Shared } | Should -Throw "*$Field*Remove it*SrcServerName/SrcDatabaseName*"
+    }
+    It 'Does not require source fields solely for <Activity> discovery' -ForEach @(
+        @{ Activity = 'Status' }, @{ Activity = 'Monitor' }, @{ Activity = 'Cutover' }
+    ) {
+        $Shared.Common.Activity = $Activity
+        foreach ($Source in $Shared.Items) {
+            $Source.PSObject.Properties.Remove('SrcServerName')
+            $Source.PSObject.Properties.Remove('SrcDatabaseName')
+        }
+        $Items = @(Resolve-DMSConfigurationItems $Shared)
+        $Items | Should -HaveCount 2
+        { New-DMSItemPlan -Items $Items } | Should -Not -Throw
+    }
+    It 'Requires source fields when Restore needs container derivation' {
+        $Shared.Items[0].SrcServerName = ''
+        { Resolve-DMSConfigurationItems $Shared } | Should -Throw '*SrcServerName*'
+    }
     It 'Inherits blank item SQL authentication settings and preserves explicit per-item overrides' {
         $Shared.Common.TargetTrustServerCertificate = $true
         $Shared.Common.TargetSqlAuthType = 'Entra'
@@ -200,12 +230,130 @@ Describe 'Exact DMS item selection' -Tag 'Unit' {
     }
 }
 
+Describe 'Configured DMS SQL service creation' -Tag 'Unit' {
+    BeforeEach {
+        $Config = Read-ServiceConfiguration $ReferencePath
+        $Plan = @(New-DMSItemPlan -Items @(Resolve-DMSConfigurationItems $Config))
+        $script:Services = @()
+        Mock Write-Host {}
+        Mock Write-Warning {}
+        Mock Write-DMSPlanResults {}
+        Mock Get-AzDataMigrationSqlService { $script:Services }
+        Mock New-AzDataMigrationSqlService {
+            $script:Services += [pscustomobject]@{
+                Name = $Name; Location = $Location; ProvisioningState = 'Succeeded'
+                Id = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.DataMigration/sqlMigrationServices/$Name"
+            }
+        }
+        Mock Invoke-DMSRestoreQueue {}
+    }
+    It 'Creates one shared service before submitting both VM and MI restores' {
+        Mock Invoke-DMSRestoreQueue {
+            $script:Services | Should -HaveCount 1
+            @($Plan | ForEach-Object { $_.Item.TargetType }) | Should -Be @('SQLVM', 'SQLMI')
+        }
+        Invoke-DMSPreparedPlan -Plan $Plan -MaxConcurrentRestores 10 -MaxConcurrentCutover 5
+        Should -Invoke New-AzDataMigrationSqlService -Times 1 -Exactly -ParameterFilter {
+            $Name -eq 'test-dms' -and $ResourceGroupName -eq 'rg-ak-personal' -and
+            $SubscriptionId -eq '11111111-1111-1111-1111-111111111111' -and $Location -eq 'centralus' -and -not $Confirm
+        }
+        Should -Invoke Invoke-DMSRestoreQueue -Times 1 -Exactly
+    }
+    It 'Creates independently named configured services rather than one service per database' {
+        $Plan[1].Item.DMSServiceName = 'mi-dms'
+        Initialize-DMSRestoreServices -Plan $Plan -Confirm:$false
+        @($script:Services.Name | Sort-Object) | Should -Be @('mi-dms', 'test-dms')
+        Should -Invoke New-AzDataMigrationSqlService -Times 2 -Exactly
+    }
+    It 'Keeps services in different subscriptions or groups separate' -ForEach @(
+        @{ Field = 'SubscriptionId'; Value = '22222222-2222-2222-2222-222222222222' }
+        @{ Field = 'DMSResourceGroup'; Value = 'another-group' }
+    ) {
+        $Plan[1].Item.($Field) = $Value
+        Mock Get-AzDataMigrationSqlService {
+            $script:Services | Where-Object {
+                $_.Id -like "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/*"
+            }
+        }
+        Initialize-DMSRestoreServices -Plan $Plan -Confirm:$false
+        Should -Invoke New-AzDataMigrationSqlService -Times 2 -Exactly
+    }
+    It 'Reuses an existing service without updating it' {
+        $script:Services = @([pscustomobject]@{ Name = 'test-dms'; Location = 'centralus'; ProvisioningState = 'Succeeded' })
+        Initialize-DMSRestoreServices -Plan $Plan
+        Should -Invoke New-AzDataMigrationSqlService -Times 0 -Exactly
+    }
+    It 'Does not let an unrelated existing service hide the missing configured service' {
+        $script:Services = @([pscustomobject]@{ Name = 'another-dms'; Location = 'centralus'; ProvisioningState = 'Succeeded' })
+        Initialize-DMSRestoreServices -Plan $Plan -Confirm:$false
+        Should -Invoke New-AzDataMigrationSqlService -Times 1 -Exactly -ParameterFilter { $Name -eq 'test-dms' }
+    }
+    It 'Deduplicates names case insensitively' {
+        $Plan[1].Item.DMSServiceName = 'TEST-DMS'
+        Initialize-DMSRestoreServices -Plan $Plan -Confirm:$false
+        Should -Invoke New-AzDataMigrationSqlService -Times 1 -Exactly
+    }
+    It 'Rejects conflicting locations before creating any service' {
+        $Plan[1].Item.Location = 'eastus'
+        { Initialize-DMSRestoreServices -Plan $Plan } | Should -Throw '*Conflicting Location*'
+        Should -Invoke Get-AzDataMigrationSqlService -Times 0 -Exactly
+        Should -Invoke New-AzDataMigrationSqlService -Times 0 -Exactly
+    }
+    It 'Rejects a failed or differently located existing service instead of overwriting it' -ForEach @(
+        @{ Location = 'eastus'; State = 'Succeeded'; Message = '*Location does not match*' }
+        @{ Location = 'centralus'; State = 'Failed'; Message = '*not successfully provisioned*' }
+    ) {
+        $script:Services = @([pscustomobject]@{ Name = 'test-dms'; Location = $Location; ProvisioningState = $State })
+        { Initialize-DMSRestoreServices -Plan $Plan } | Should -Throw $Message
+        Should -Invoke New-AzDataMigrationSqlService -Times 0 -Exactly
+    }
+    It 'Surfaces service discovery errors instead of treating them as absence' -ForEach @(
+        @{ Message = 'AuthorizationFailed' }, @{ Message = 'Network timeout' }, @{ Message = 'ResourceGroupNotFound' }
+    ) {
+        Mock Get-AzDataMigrationSqlService { throw $Message }
+        { Initialize-DMSRestoreServices -Plan $Plan } | Should -Throw "*$Message*"
+        Should -Invoke New-AzDataMigrationSqlService -Times 0 -Exactly
+    }
+    It 'Stops migration submission when creation fails' {
+        Mock New-AzDataMigrationSqlService { throw 'DMS creation denied' }
+        { Invoke-DMSPreparedPlan -Plan $Plan -MaxConcurrentRestores 10 -MaxConcurrentCutover 5 } |
+            Should -Throw '*DMS creation denied*'
+        Should -Invoke Invoke-DMSRestoreQueue -Times 0 -Exactly
+        Should -Invoke Write-DMSPlanResults -Times 1 -Exactly -ParameterFilter { $ErrorMessage -like '*creation denied*' }
+    }
+    It 'Verifies the newly created resource before allowing migration submission' {
+        Mock New-AzDataMigrationSqlService {}
+        { Invoke-DMSPreparedPlan -Plan $Plan -MaxConcurrentRestores 10 -MaxConcurrentCutover 5 } |
+            Should -Throw '*could not be verified*'
+        Should -Invoke Invoke-DMSRestoreQueue -Times 0 -Exactly
+    }
+    It 'Does not create resources when the service helper is previewed directly' {
+        Initialize-DMSRestoreServices -Plan $Plan -WhatIf
+        Should -Invoke New-AzDataMigrationSqlService -Times 0 -Exactly
+    }
+    It 'Does not create services for skipped existing targets' {
+        foreach ($Entry in $Plan) { $Entry | Add-Member RestoreState ([pscustomobject]@{ Skip = $true }) }
+        Initialize-DMSRestoreServices -Plan $Plan
+        Should -Invoke Get-AzDataMigrationSqlService -Times 0 -Exactly
+        Should -Invoke New-AzDataMigrationSqlService -Times 0 -Exactly
+    }
+    It 'Does not create services for <Activity>' -ForEach @(
+        @{ Activity = 'Status' }, @{ Activity = 'Monitor' }, @{ Activity = 'Cutover' }, @{ Activity = 'Remove' }
+    ) {
+        foreach ($Entry in $Plan) { $Entry.Item.Activity = $Activity }
+        Initialize-DMSRestoreServices -Plan $Plan
+        Should -Invoke Get-AzDataMigrationSqlService -Times 0 -Exactly
+        Should -Invoke New-AzDataMigrationSqlService -Times 0 -Exactly
+    }
+}
+
 Describe 'Mixed-target workflow safeguards' -Tag 'Unit' {
     BeforeEach {
         Mock Write-Host {}
         Mock Read-Host { throw 'Unexpected prompt' }
         Mock Invoke-DataMigrationPreflight {}
         Mock Initialize-DMSRestorePlan {}
+        Mock Initialize-DMSRestoreServices {}
         Mock New-DMSRunDirectory { Join-Path $TestDrive 'run' }
         Mock Invoke-DMSRun {
             Invoke-DMSPreparedPlan -Plan $Plan -MaxConcurrentRestores $MaxConcurrentRestores `
@@ -224,6 +372,7 @@ Describe 'Mixed-target workflow safeguards' -Tag 'Unit' {
         Should -Invoke Invoke-DataMigrationPreflight -Times 2 -Exactly
         Should -Invoke Invoke-DMSRestoreQueue -Times 0 -Exactly
         Should -Invoke Write-DMSPlanResults -Times 0 -Exactly
+        Should -Invoke Initialize-DMSRestoreServices -Times 0 -Exactly
     }
     It 'Resolves the local credential file beside a custom configuration, not the terminal directory' {
         $Shared | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Path
@@ -244,6 +393,7 @@ Describe 'Mixed-target workflow safeguards' -Tag 'Unit' {
         { Invoke-DMSConfiguredActivity -ConfigPath $Path -Activity Restore -Confirm:$false } | Should -Throw '*MI denied*'
         Should -Invoke Invoke-DMSRestoreQueue -Times 0 -Exactly
         Should -Invoke Write-DMSPlanResults -Times 0 -Exactly
+        Should -Invoke Initialize-DMSRestoreServices -Times 0 -Exactly
     }
     It 'Dispatches configured Cutover for both target types without a CLI activity override' {
         $Shared.Common.Activity = 'Cutover'
@@ -605,11 +755,22 @@ Describe 'Unified restore submission and target routing' -Tag 'Unit' {
         (Start-DMSItemRestore -Entry $Plan[1] -Confirm:$false).Status | Should -Be 'Submitted'
         Should -Invoke Read-Host -Times 0 -Exactly
     }
-    It 'Derives the same container name as the uploader when it is omitted' {
-        $Plan[1].Item.BackupStorageContainerName = ''
-        $null = Start-DMSItemRestore -Entry $Plan[1] -Confirm:$false
-        Should -Invoke New-AzDataMigrationToSqlManagedInstance -Times 1 -Exactly -ParameterFilter {
-            $AzureBlobContainerName -eq 'desktop-sga61qp-dmf-migrdemo'
+    It 'Uses the source mapping for <Target> with <Server>, even when the target database is renamed' -ForEach @(
+        @{ Target = 'SQLVM'; Server = 'SoUrCe'; Expected = 'source-appdb' }
+        @{ Target = 'SQLVM'; Server = 'SoUrCe\InStAnCe'; Expected = 'source-instance-appdb' }
+        @{ Target = 'SQLMI'; Server = 'SoUrCe'; Expected = 'source-appdb' }
+        @{ Target = 'SQLMI'; Server = 'SoUrCe\InStAnCe'; Expected = 'source-instance-appdb' }
+    ) {
+        $Entry = $Plan | Where-Object { $_.Item.TargetType -eq $Target }
+        $Entry.Item.SrcServerName = $Server
+        $Entry.Item.SrcDatabaseName = 'AppDb'
+        $Entry.Item.TrgDatabaseName = 'RenamedDb'
+        Mock Get-AzStorageBlob { [pscustomobject]@{ Name = 'AppDb_20261023_010000.bak' } }
+        $null = Start-DMSItemRestore -Entry $Entry -Confirm:$false
+        $Command = if ($Target -eq 'SQLVM') { 'New-AzDataMigrationToSqlVM' } else { 'New-AzDataMigrationToSqlManagedInstance' }
+        Should -Invoke Get-AzStorageBlob -Times 1 -Exactly -ParameterFilter { $Container -eq $Expected }
+        Should -Invoke $Command -Times 1 -Exactly -ParameterFilter {
+            $AzureBlobContainerName -eq $Expected -and $TargetDbName -eq 'RenamedDb'
         }
     }
     It 'Aborts on an uncertain existing-migration lookup instead of continuing to submit' {
@@ -617,14 +778,17 @@ Describe 'Unified restore submission and target routing' -Tag 'Unit' {
         { Start-DMSItemRestore -Entry $Plan[1] -Confirm:$false } | Should -Throw '*Inventory permission denied*'
         Should -Invoke New-AzDataMigrationToSqlManagedInstance -Times 0 -Exactly
     }
-    It 'Does not submit a migration when backup discovery fails or no FULL is usable' -ForEach @(
-        @{ Failure = 'Denied' }, @{ Failure = 'NoFull' }
+    It 'Does not submit <Target> when backup discovery fails or no FULL is usable: <Failure>' -ForEach @(
+        @{ Target = 'SQLVM'; Failure = 'Denied' }, @{ Target = 'SQLVM'; Failure = 'NoFull' }
+        @{ Target = 'SQLMI'; Failure = 'Denied' }, @{ Target = 'SQLMI'; Failure = 'NoFull' }
     ) {
         Mock Get-AzStorageBlob {
             if ($Failure -eq 'Denied') { throw 'Blob read denied' }
             @(@{ Name = 'MIGRDEMO_20261023_030000.trn' })
         }
-        { Start-DMSItemRestore -Entry $Plan[1] -Confirm:$false } | Should -Throw
+        $Entry = $Plan | Where-Object { $_.Item.TargetType -eq $Target }
+        { Start-DMSItemRestore -Entry $Entry -Confirm:$false } | Should -Throw
+        Should -Invoke New-AzDataMigrationToSqlVM -Times 0 -Exactly
         Should -Invoke New-AzDataMigrationToSqlManagedInstance -Times 0 -Exactly
     }
     It 'Checks backup discovery before any approved database replacement' {
